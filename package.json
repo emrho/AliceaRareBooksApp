@@ -1,0 +1,19 @@
+{
+  "name": "alicea-rare-books",
+  "version": "1.0.0",
+  "description": "Inventory, time tracking and owner dashboard for a home book business selling on eBay, Whatnot and Amazon",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server/index.js",
+    "seed": "node --disable-warning=ExperimentalWarning server/seed.js",
+    "test": "node --disable-warning=ExperimentalWarning --test"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
