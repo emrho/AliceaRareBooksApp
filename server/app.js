@@ -6,9 +6,11 @@ import { COOKIE, createSession, hashPassword, sessionUser, verifyPassword } from
 import {
   addDays, computePay, entryHours, isValidDate, isValidTimestamp, nowLocal, todayLocal, weekStartOf,
 } from './payroll.js';
+import { SECTIONS, parseSheetUrl, serviceAccount, syncAll } from './sheets.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 export const CHANNELS = ['ebay', 'whatnot', 'amazon', 'other'];
+const SECTION_TABLE = { inventory: 'books', sales: 'sales', expenses: 'expenses' };
 
 class ApiError extends Error {
   constructor(status, message) {
@@ -84,7 +86,7 @@ function sendCsv(res, filename, body) {
 
 // ---- app ------------------------------------------------------------------
 
-export function createApp(db) {
+export function createApp(db, { fetchImpl, env = process.env } = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '1mb' }));
@@ -112,6 +114,52 @@ export function createApp(db) {
     next();
   };
 
+  // ---- Google Sheets links ------------------------------------------------
+
+  const linked = (section, settings = getSettings(db)) => !!settings[`sheets_${section}_url`];
+  const LINKED_MSG = {
+    inventory: 'Inventory comes from your Google Sheet. Make this change in the sheet, then sync.',
+    sales: 'Sales come from your Google Sheet. Make this change in the sheet, then sync.',
+    expenses: 'Expenses come from your Google Sheet. Make this change in the sheet, then sync.',
+  };
+  const fromSheet = (section, row) => {
+    if (row?.origin === 'sheet') throw new ApiError(409, LINKED_MSG[section]);
+  };
+  const notLinked = (section) => {
+    if (linked(section)) throw new ApiError(409, LINKED_MSG[section]);
+  };
+
+  function lastSync(settings) {
+    try { return JSON.parse(settings.sheets_last_result || 'null'); } catch { return null; }
+  }
+
+  function sheetsStatus(settings, isOwnerUser) {
+    const last = lastSync(settings);
+    const out = { lastSyncAt: last?.at || null, lastOk: last ? last.ok : null };
+    for (const sec of SECTIONS) {
+      out[sec] = linked(sec, settings);
+      if (isOwnerUser && out[sec]) out[`${sec}Url`] = settings[`sheets_${sec}_url`];
+    }
+    return out;
+  }
+
+  let syncing = null;
+  /** Runs one sync at a time; concurrent callers share the in-flight run. */
+  function syncSheets() {
+    if (syncing) return syncing;
+    const settings = getSettings(db);
+    const urls = Object.fromEntries(SECTIONS.map((sec) => [sec, settings[`sheets_${sec}_url`]]));
+    syncing = syncAll(db, urls, { ...(fetchImpl && { fetchImpl }), sa: serviceAccount(env) })
+      .then((result) => {
+        db.prepare(`UPDATE settings SET value = ? WHERE key = 'sheets_last_result'`).run(JSON.stringify(result));
+        return result;
+      })
+      .finally(() => { syncing = null; });
+    return syncing;
+  }
+  app.locals.syncSheets = syncSheets;
+  app.locals.sheetsLinked = () => SECTIONS.some((sec) => linked(sec));
+
   // Reject cross-site form posts: every mutating API call must be JSON.
   app.use('/api', (req, res, next) => {
     if (!['GET', 'HEAD'].includes(req.method) && !req.is('application/json')) {
@@ -132,6 +180,7 @@ export function createApp(db) {
       businessName: settings.business_name,
       weekStart: Number(settings.week_start),
       today: todayLocal(),
+      sheets: user ? sheetsStatus(settings, user.role === 'owner') : null,
     });
   });
 
@@ -251,6 +300,7 @@ export function createApp(db) {
   });
 
   app.post('/api/books', auth, (req, res) => {
+    notLinked('inventory');
     const b = readBook(req.body);
     const cols = Object.keys(b);
     const id = uniqueSku(() => db.prepare(`INSERT INTO books (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`)
@@ -259,7 +309,9 @@ export function createApp(db) {
   });
 
   app.put('/api/books/:id', auth, (req, res) => {
-    if (!db.prepare('SELECT id FROM books WHERE id = ?').get(req.params.id)) throw new ApiError(404, 'Book not found');
+    const existing = db.prepare('SELECT id, origin FROM books WHERE id = ?').get(req.params.id);
+    if (!existing) throw new ApiError(404, 'Book not found');
+    fromSheet('inventory', existing);
     const b = readBook(req.body);
     const cols = Object.keys(b);
     uniqueSku(() => db.prepare(`UPDATE books SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ?`)
@@ -268,6 +320,7 @@ export function createApp(db) {
   });
 
   app.delete('/api/books/:id', auth, ownerOnly, (req, res) => {
+    fromSheet('inventory', db.prepare('SELECT origin FROM books WHERE id = ?').get(req.params.id));
     const used = db.prepare('SELECT COUNT(*) AS n FROM sales WHERE book_id = ?').get(req.params.id).n;
     if (used) {
       db.prepare(`UPDATE books SET archived = 1, updated_at = datetime('now') WHERE id = ?`).run(req.params.id);
@@ -310,6 +363,7 @@ export function createApp(db) {
   });
 
   app.post('/api/sales', auth, (req, res) => {
+    notLinked('sales');
     const s = readSaleMoney(req.body);
     const quantity = int(req.body, 'quantity', { min: 1, max: 10000, fallback: 1 });
     const bookId = req.body.book_id ? int(req.body, 'book_id', { min: 1 }) : null;
@@ -343,6 +397,7 @@ export function createApp(db) {
   app.put('/api/sales/:id', auth, ownerOnly, (req, res) => {
     const existing = db.prepare('SELECT * FROM sales WHERE id = ?').get(req.params.id);
     if (!existing) throw new ApiError(404, 'Sale not found');
+    fromSheet('sales', existing);
     const s = readSaleMoney(req.body);
     const cost = req.body.cost_cents === undefined ? existing.cost_cents : int(req.body, 'cost_cents');
     const title = existing.book_id ? existing.title : str(req.body, 'title', { required: true, max: 300 });
@@ -356,6 +411,7 @@ export function createApp(db) {
     tx(db, () => {
       const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(req.params.id);
       if (!sale) throw new ApiError(404, 'Sale not found');
+      fromSheet('sales', sale);
       if (sale.book_id && req.body?.restock !== false) {
         db.prepare(`UPDATE books SET quantity = quantity + ?, updated_at = datetime('now') WHERE id = ?`).run(sale.quantity, sale.book_id);
       }
@@ -383,6 +439,7 @@ export function createApp(db) {
   });
 
   app.post('/api/expenses', auth, ownerOnly, (req, res) => {
+    notLinked('expenses');
     const e = readExpense(req.body);
     const id = db.prepare(`INSERT INTO expenses (expense_date, category, vendor, amount_cents, notes, created_by) VALUES (?,?,?,?,?,?)`)
       .run(e.expense_date, e.category, e.vendor, e.amount_cents, e.notes, req.user.id).lastInsertRowid;
@@ -390,6 +447,7 @@ export function createApp(db) {
   });
 
   app.put('/api/expenses/:id', auth, ownerOnly, (req, res) => {
+    fromSheet('expenses', db.prepare('SELECT origin FROM expenses WHERE id = ?').get(req.params.id));
     const e = readExpense(req.body);
     const r = db.prepare(`UPDATE expenses SET expense_date=?, category=?, vendor=?, amount_cents=?, notes=? WHERE id = ?`)
       .run(e.expense_date, e.category, e.vendor, e.amount_cents, e.notes, req.params.id);
@@ -398,6 +456,7 @@ export function createApp(db) {
   });
 
   app.delete('/api/expenses/:id', auth, ownerOnly, (req, res) => {
+    fromSheet('expenses', db.prepare('SELECT origin FROM expenses WHERE id = ?').get(req.params.id));
     const r = db.prepare('DELETE FROM expenses WHERE id = ?').run(req.params.id);
     if (!r.changes) throw new ApiError(404, 'Expense not found');
     res.json({ deleted: true });
@@ -631,6 +690,54 @@ export function createApp(db) {
     res.json({ categories: getSettings(db).expense_categories.split(',') });
   });
 
+  // ---- google sheets ------------------------------------------------------
+
+  app.get('/api/sheets', auth, ownerOnly, (req, res) => {
+    const settings = getSettings(db);
+    const sa = serviceAccount(env);
+    res.json({
+      urls: Object.fromEntries(SECTIONS.map((sec) => [sec, settings[`sheets_${sec}_url`]])),
+      autoMinutes: Number(settings.sheets_auto_minutes),
+      serviceAccountEmail: sa && !sa.error ? sa.client_email : null,
+      serviceAccountError: sa?.error || null,
+      last: lastSync(settings),
+      // Rows entered in the app that sit alongside a linked tab (they'd be counted twice
+      // if the sheet holds the same history).
+      appRows: Object.fromEntries(SECTIONS.filter((sec) => linked(sec, settings))
+        .map((sec) => [sec, db.prepare(`SELECT COUNT(*) AS n FROM ${SECTION_TABLE[sec]} WHERE origin = 'app'`).get().n])),
+    });
+  });
+
+  app.post('/api/sheets/clear-app', auth, ownerOnly, (req, res) => {
+    const sec = req.body.section;
+    if (!SECTIONS.includes(sec)) throw bad('Unknown section');
+    if (!linked(sec)) throw bad('Only sections linked to a sheet can be cleared');
+    const r = db.prepare(`DELETE FROM ${SECTION_TABLE[sec]} WHERE origin = 'app'`).run();
+    res.json({ deleted: r.changes });
+  });
+
+  app.put('/api/sheets', auth, ownerOnly, (req, res) => {
+    const urls = req.body.urls || {};
+    const out = {};
+    for (const sec of SECTIONS) {
+      if (!(sec in urls)) continue;
+      try {
+        out[`sheets_${sec}_url`] = parseSheetUrl(urls[sec])?.url || '';
+      } catch (err) {
+        throw bad(`${sec[0].toUpperCase()}${sec.slice(1)} link: ${err.message}`);
+      }
+    }
+    if ('autoMinutes' in req.body) out.sheets_auto_minutes = String(int(req.body, 'autoMinutes', { max: 1440 }));
+    const upd = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+    tx(db, () => Object.entries(out).forEach(([k, v]) => upd.run(k, v)));
+    res.json({ ok: true, sheets: sheetsStatus(getSettings(db), true) });
+  });
+
+  app.post('/api/sheets/sync', auth, ownerOnly, async (req, res) => {
+    if (!SECTIONS.some((sec) => linked(sec))) throw bad('Add at least one Google Sheets link first');
+    res.json(await syncSheets());
+  });
+
   // ---- dashboard ----------------------------------------------------------
 
   app.get('/api/dashboard', auth, ownerOnly, (req, res) => {
@@ -717,6 +824,7 @@ export function createApp(db) {
       teamWeek: { from: thisWeek.from, to: thisWeek.to, totals: thisWeek.totals },
       inventory,
       recentSales,
+      sheets: sheetsStatus(settings, true),
     });
   });
 

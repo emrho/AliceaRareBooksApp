@@ -3,3 +3,7 @@ data/
 *.db
 *.db-*
 .env
+
+# Google service account keys
+*service-account*.json
+*-key.json

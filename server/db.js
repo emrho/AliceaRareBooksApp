@@ -109,6 +109,20 @@ export const DEFAULT_SETTINGS = {
   overtime_threshold_hours: '40',
   overtime_multiplier: '1.5',
   expense_categories: 'Inventory purchases,Shipping supplies,Postage,Platform subscriptions,Equipment,Software,Marketing,Travel,Other',
+  // Google Sheets links (one per tab); empty = that section is managed in the app.
+  sheets_inventory_url: '',
+  sheets_sales_url: '',
+  sheets_expenses_url: '',
+  sheets_auto_minutes: '15',
+  sheets_last_result: '',
+};
+
+// Columns added after the first release; ALTER TABLE them onto older databases.
+const ADDED_COLUMNS = {
+  // origin: 'app' (entered here) or 'sheet' (imported from Google Sheets)
+  books: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER' },
+  sales: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER' },
+  expenses: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER' },
 };
 
 export function openDb(file = process.env.DB_PATH || path.join(process.cwd(), 'data', 'books.db')) {
@@ -116,6 +130,10 @@ export function openDb(file = process.env.DB_PATH || path.join(process.cwd(), 'd
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
+  for (const [table, cols] of Object.entries(ADDED_COLUMNS)) {
+    const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+    for (const [col, def] of Object.entries(cols)) if (!have.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  }
   const insert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) insert.run(k, v);
   return db;

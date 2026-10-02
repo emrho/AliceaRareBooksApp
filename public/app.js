@@ -91,15 +91,15 @@ function toast(msg, isError = false) {
  * Opens a form dialog. onSubmit(values, form) may throw to show an error and keep
  * the dialog open; resolve to close it.
  */
-function openModal({ title, body, submitLabel = 'Save', onSubmit, extra = '', onOpen, wide = false }) {
+function openModal({ title, body, submitLabel = 'Save', onSubmit, extra = '', onOpen, wide = false, readOnly = false }) {
   const dlg = $('#modal');
   dlg.style.width = wide ? 'min(900px, calc(100vw - 32px))' : '';
   dlg.innerHTML = html`
     <form class="modal" novalidate>
       <div class="modal-head"><h2>${title}</h2><button type="button" class="icon-btn" data-close aria-label="Close">✕</button></div>
-      <div class="modal-body">${body}<div class="error" role="alert"></div></div>
+      <div class="modal-body">${readOnly ? html`<fieldset disabled class="plain">${body}</fieldset>` : body}<div class="error" role="alert"></div></div>
       <div class="modal-foot">${extra}<span class="spacer"></span>
-        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="button" class="btn" data-close>${submitLabel ? 'Cancel' : 'Close'}</button>
         ${submitLabel ? html`<button type="submit" class="btn primary">${submitLabel}</button>` : ''}
       </div>
     </form>`.s;
@@ -108,6 +108,7 @@ function openModal({ title, body, submitLabel = 'Save', onSubmit, extra = '', on
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = $('button[type=submit]', form);
+    if (!btn) return;
     btn.disabled = true;
     $('.error', form).textContent = '';
     try {
@@ -137,7 +138,7 @@ function confirmModal(title, message, confirmLabel = 'Confirm') {
 
 // ---- state & routing --------------------------------------------------------------
 
-const state = { user: null, businessName: '', weekStart: 1, needsSetup: false };
+const state = { user: null, businessName: '', weekStart: 1, needsSetup: false, sheets: {} };
 let timers = [];
 const isOwner = () => state.user?.role === 'owner';
 
@@ -173,7 +174,7 @@ function currentRoute() {
 
 async function boot() {
   const s = await api('/status');
-  Object.assign(state, { user: s.user, businessName: s.businessName, weekStart: s.weekStart, needsSetup: s.needsSetup });
+  Object.assign(state, { user: s.user, businessName: s.businessName, weekStart: s.weekStart, needsSetup: s.needsSetup, sheets: s.sheets || {} });
   document.title = s.businessName || 'Book Shop Manager';
   renderApp();
 }
@@ -301,6 +302,57 @@ function changePasswordModal() {
   });
 }
 
+// ---- shared: Google Sheets ------------------------------------------------------------------
+
+const SECTIONS_LINKED = (sh) => !!(sh && (sh.inventory || sh.sales || sh.expenses));
+const SECTION_LABEL = { inventory: 'Inventory', sales: 'Sales', expenses: 'Expenses' };
+const sheetLinked = (section) => !!state.sheets?.[section];
+
+function timeAgo(iso) {
+  if (!iso) return 'never';
+  const m = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m} min ago`;
+  if (m < 1440) return `${Math.round(m / 60)} hr ago`;
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+async function refreshStatus() {
+  const s = await api('/status');
+  state.sheets = s.sheets || {};
+}
+
+/** Runs a sync, reports the outcome, and calls reload() when done. */
+async function runSync(reload, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  try {
+    const r = await api('/sheets/sync', { method: 'POST' });
+    await refreshStatus();
+    const parts = Object.entries(r.sections).map(([k, v]) => (v.ok ? `${SECTION_LABEL[k]}: ${v.imported} row${v.imported === 1 ? '' : 's'}${v.skipped.count ? ` (${v.skipped.count} skipped)` : ''}` : `${SECTION_LABEL[k]}: failed`));
+    toast(`Synced from Google Sheets — ${parts.join(' · ')}`, !r.ok);
+  } catch (err) {
+    toast(err.message, true);
+  }
+  reload?.();
+}
+
+/** Notice at the top of a page whose data comes from a Google Sheet. */
+function sheetBanner(section) {
+  if (!sheetLinked(section)) return '';
+  const url = state.sheets[`${section}Url`];
+  return html`<div class="sheet-banner">
+    <span class="sheet-icon" aria-hidden="true">▦</span>
+    <span>${SECTION_LABEL[section]} ${section === 'inventory' ? 'comes' : 'come'} from your Google Sheet. Add or change ${section === 'inventory' ? 'books' : section} there.
+      <span class="muted">Last synced ${timeAgo(state.sheets.lastSyncAt)}${state.sheets.lastOk === false ? ' (with problems — see Settings)' : ''}.</span></span>
+    <span class="row">${url ? html`<a class="btn small" href="${url}" target="_blank" rel="noopener">Open sheet</a>` : ''}
+      ${isOwner() ? html`<button class="btn small" data-sync>Sync now</button>` : ''}</span>
+  </div>`;
+}
+function bindSheetBanner(root, reload) {
+  $$('[data-sync]', root).forEach((b) => b.addEventListener('click', () => runSync(reload, b)));
+}
+const fromSheetToast = (row) => toast(`This comes from row ${row.sheet_row || '?'} of your Google Sheet — edit it there, then sync.`);
+
 // ---- shared: date range picker ---------------------------------------------------------
 
 const RANGE_PRESETS = {
@@ -352,7 +404,8 @@ async function pageDashboard(main) {
 
   main.innerHTML = html`
     <div class="page-head">
-      <div><h1>Dashboard</h1><div class="sub">${rangeLabel(d)}</div></div>
+      <div><h1>Dashboard</h1><div class="sub">${rangeLabel(d)}${SECTIONS_LINKED(d.sheets) ? html` · Google Sheets synced ${timeAgo(d.sheets.lastSyncAt)}` : ''}</div></div>
+      ${SECTIONS_LINKED(d.sheets) ? html`<button class="btn" data-sync>Sync now</button>` : ''}
     </div>
     <div class="toolbar">${rangeControls()}</div>
 
@@ -455,6 +508,7 @@ async function pageDashboard(main) {
     </div>`.s;
 
   bindRange(main, () => pageDashboard(main));
+  bindSheetBanner(main, () => pageDashboard(main));
   $('[data-stale]', main)?.addEventListener('click', () => { invState.status = 'stale'; });
   weeklyChart($('#weekly-chart', main), d.weeks);
 }
@@ -623,10 +677,11 @@ async function pageInventory(main) {
       <div><h1>Inventory</h1><div class="sub">${counts.active || 0} titles in stock</div></div>
       <div class="row">
         ${owner ? html`<a class="btn" href="/api/export/books.csv">Export CSV</a>` : ''}
-        <button class="btn primary" id="add-book">+ Add book</button>
+        ${sheetLinked('inventory') ? '' : html`<button class="btn primary" id="add-book">+ Add book</button>`}
       </div>
     </div>
-    ${counts.stale ? html`<div class="alert"><span>⚠</span><span><strong>${counts.stale} sold-out ${counts.stale === 1 ? 'book is' : 'books are'} still marked as listed</strong> on eBay, Whatnot or Amazon. End those listings, then uncheck them here, so nothing sells twice.</span></div>` : ''}
+    ${sheetBanner('inventory')}
+    ${counts.stale ? html`<div class="alert"><span>⚠</span><span><strong>${counts.stale} sold-out ${counts.stale === 1 ? 'book is' : 'books are'} still marked as listed</strong> on eBay, Whatnot or Amazon. End those listings, then ${sheetLinked('inventory') ? 'update the sheet' : 'uncheck them here'}, so nothing sells twice.</span></div>` : ''}
     <div class="toolbar">
       <input type="search" id="inv-q" placeholder="Search title, author, SKU, ISBN, shelf…" value="${invState.q}" aria-label="Search inventory">
       <div class="seg" role="group" aria-label="Stock status">${statusTabs.map(([k, l]) => html`<button type="button" data-status="${k}" aria-pressed="${invState.status === k}">${l}${k !== 'all' ? html`<span class="count">${counts[k] || 0}</span>` : ''}</button>`)}</div>
@@ -648,7 +703,7 @@ async function pageInventory(main) {
           ${owner ? html`<td class="num">${money(b.cost_cents)}</td>` : ''}
           <td class="num">${money(b.list_price_cents)}</td>
           <td><div class="chips">${LISTING_CHANNELS.filter((k) => b[`${k}_listed`]).map((k) => channelChip(k))}${b.archived ? html`<span class="pill">archived</span>` : ''}</div></td>
-          <td class="num">${b.quantity > 0 && !b.archived ? html`<button class="btn small" data-sell="${b.id}">Sell</button>` : ''}</td>
+          <td class="num">${b.quantity > 0 && !b.archived && !sheetLinked('sales') ? html`<button class="btn small" data-sell="${b.id}">Sell</button>` : ''}</td>
         </tr>`) : html`<tr><td colspan="9" class="empty">${invState.q ? 'No books match your search.' : 'Nothing here yet.'}</td></tr>`}
         </tbody></table></div>
     </div>`.s;
@@ -669,7 +724,8 @@ async function pageInventory(main) {
   });
   $$('[data-status]', main).forEach((b) => b.addEventListener('click', () => { invState.status = b.dataset.status; reload(); }));
   $('#inv-ch').addEventListener('change', (e) => { invState.channel = e.target.value; reload(); });
-  $('#add-book').addEventListener('click', async () => bookModal(null, reload));
+  $('#add-book')?.addEventListener('click', async () => bookModal(null, reload));
+  bindSheetBanner(main, reload);
   const byId = new Map(books.map((b) => [String(b.id), b]));
   $$('tr[data-id]', main).forEach((tr) => tr.addEventListener('click', (e) => {
     if (e.target.closest('[data-sell]')) return;
@@ -682,8 +738,11 @@ async function bookModal(book, onDone) {
   const isNew = !book;
   const b = book || { sku: (await api('/books/next-sku')).sku, quantity: 1, acquired_date: today() };
   const owner = isOwner();
+  const readOnly = b.origin === 'sheet';
   openModal({
-    title: isNew ? 'Add book' : `Edit ${b.sku}`,
+    title: readOnly ? `${b.sku} — from Google Sheets` : isNew ? 'Add book' : `Edit ${b.sku}`,
+    submitLabel: readOnly ? null : 'Save',
+    readOnly,
     wide: true,
     body: html`
       <div class="form-grid">
@@ -714,8 +773,9 @@ async function bookModal(book, onDone) {
       </div>
       <datalist id="conditions">${['As New', 'Fine', 'Near Fine', 'Very Good', 'Good', 'Fair', 'Poor'].map((c) => html`<option value="${c}">`)}</datalist>
       <datalist id="bindings">${['Hardcover', 'Hardcover w/ DJ', 'Paperback', 'Mass Market', 'Leather', 'Signed'].map((c) => html`<option value="${c}">`)}</datalist>`,
-    extra: html`${!isNew && owner ? html`<button type="button" class="btn danger" id="del-book">Delete</button>` : ''}
-      ${!isNew && b.quantity > 0 && !b.archived ? html`<button type="button" class="btn" id="sell-book">Record sale</button>` : ''}`,
+    extra: html`${!isNew && owner && !readOnly ? html`<button type="button" class="btn danger" id="del-book">Delete</button>` : ''}
+      ${readOnly ? html`<span class="muted small">Row ${b.sheet_row} of your sheet — edit it there.</span>` : ''}
+      ${!isNew && b.quantity > 0 && !b.archived && !sheetLinked('sales') ? html`<button type="button" class="btn" id="sell-book">Record sale</button>` : ''}`,
     onSubmit: async (v) => {
       const body = { ...v, cost_cents: toCents(v.cost), list_price_cents: toCents(v.list_price) };
       for (const k of LISTING_CHANNELS) body[`${k}_listed`] = !!v[`${k}_listed`];
@@ -788,7 +848,10 @@ async function saleModal({ book = null, sale = null, onDone }) {
       const r = await api('/sales', { method: 'POST', body });
       toast('Sale recorded');
       onDone?.();
-      if (r.stillListed?.length) delistPrompt(r.sale.book_id, r.stillListed, onDone);
+      if (r.stillListed?.length) {
+        if (sheetLinked('inventory')) toast(`Last copy sold — end the ${r.stillListed.map((c) => CHANNELS[c].label).join(', ')} listing and set its quantity to 0 in your sheet.`);
+        else delistPrompt(r.sale.book_id, r.stillListed, onDone);
+      }
     },
     onOpen: (form, dlg) => {
       const net = () => {
@@ -848,8 +911,9 @@ async function pageSales(main) {
   main.innerHTML = html`
     <div class="page-head">
       <div><h1>Sales</h1><div class="sub">${rangeLabel(r)}</div></div>
-      <div class="row"><a class="btn" href="/api/export/sales.csv?from=${r.from}&to=${r.to}">Export CSV</a><button class="btn primary" id="add-sale">+ Record sale</button></div>
+      <div class="row"><a class="btn" href="/api/export/sales.csv?from=${r.from}&to=${r.to}">Export CSV</a>${sheetLinked('sales') ? '' : html`<button class="btn primary" id="add-sale">+ Record sale</button>`}</div>
     </div>
+    ${sheetBanner('sales')}
     <div class="toolbar">${rangeControls()}
       <select id="sale-ch" aria-label="Channel"><option value="">All channels</option>${Object.entries(CHANNELS).map(([k, c]) => html`<option value="${k}" ${salesState.channel === k ? 'selected' : ''}>${c.label}</option>`)}</select>
     </div>
@@ -863,7 +927,7 @@ async function pageSales(main) {
       <thead><tr><th>Date</th><th>Channel</th><th>Book</th><th class="num">Price</th><th class="num">Ship chg.</th><th class="num">Fees</th><th class="num">Postage</th><th class="num">Cost</th><th class="num">Profit</th></tr></thead>
       <tbody>${sales.length ? sales.map((s) => html`<tr class="clickable" data-id="${s.id}">
         <td class="nowrap">${prettyDate(s.sale_date)}</td><td>${channelChip(s.channel)}</td>
-        <td class="title-cell"><div class="t">${s.title}${s.quantity > 1 ? ` ×${s.quantity}` : ''}</div><div class="s">${[s.sku, s.order_ref, s.created_by_name && `by ${s.created_by_name}`].filter(Boolean).join(' · ')}</div></td>
+        <td class="title-cell"><div class="t">${s.title}${s.quantity > 1 ? ` ×${s.quantity}` : ''}</div><div class="s">${[s.sku, s.order_ref, s.created_by_name && `by ${s.created_by_name}`, s.origin === 'sheet' && `sheet row ${s.sheet_row}`].filter(Boolean).join(' · ')}</div></td>
         <td class="num">${money(s.sale_price_cents)}</td><td class="num">${money(s.shipping_charged_cents)}</td>
         <td class="num">${money(s.platform_fees_cents)}</td><td class="num">${money(s.shipping_cost_cents)}</td>
         <td class="num">${money(s.cost_cents)}</td><td class="num ${net(s) < 0 ? 'neg' : ''}"><strong>${money(net(s))}</strong></td></tr>`) : html`<tr><td colspan="9" class="empty">No sales in this range.</td></tr>`}
@@ -871,9 +935,14 @@ async function pageSales(main) {
   const reload = () => pageSales(main);
   bindRange(main, reload);
   $('#sale-ch').addEventListener('change', (e) => { salesState.channel = e.target.value; reload(); });
-  $('#add-sale').addEventListener('click', () => saleModal({ onDone: reload }));
+  $('#add-sale')?.addEventListener('click', () => saleModal({ onDone: reload }));
+  bindSheetBanner(main, reload);
   const byId = new Map(sales.map((s) => [String(s.id), s]));
-  $$('tr[data-id]', main).forEach((tr) => tr.addEventListener('click', () => saleModal({ sale: byId.get(tr.dataset.id), onDone: reload })));
+  $$('tr[data-id]', main).forEach((tr) => tr.addEventListener('click', () => {
+    const sale = byId.get(tr.dataset.id);
+    if (sale.origin === 'sheet') fromSheetToast(sale);
+    else saleModal({ sale, onDone: reload });
+  }));
 }
 
 // ---- expenses ---------------------------------------------------------------------------
@@ -887,8 +956,9 @@ async function pageExpenses(main) {
   main.innerHTML = html`
     <div class="page-head">
       <div><h1>Expenses</h1><div class="sub">${rangeLabel(r)} · ${money(total)} total</div></div>
-      <div class="row"><a class="btn" href="/api/export/expenses.csv?from=${r.from}&to=${r.to}">Export CSV</a><button class="btn primary" id="add-exp">+ Add expense</button></div>
+      <div class="row"><a class="btn" href="/api/export/expenses.csv?from=${r.from}&to=${r.to}">Export CSV</a>${sheetLinked('expenses') ? '' : html`<button class="btn primary" id="add-exp">+ Add expense</button>`}</div>
     </div>
+    ${sheetBanner('expenses')}
     <div class="toolbar">${rangeControls()}</div>
     <div class="chips" style="margin-bottom:14px">${Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([c, v]) => html`<span class="pill">${c}: ${money(v)}</span>`)}</div>
     <div class="card"><div class="table-wrap"><table>
@@ -931,9 +1001,14 @@ async function pageExpenses(main) {
       }),
     });
   };
-  $('#add-exp').addEventListener('click', () => modal(null));
+  $('#add-exp')?.addEventListener('click', () => modal(null));
+  bindSheetBanner(main, reload);
   const byId = new Map(expenses.map((e) => [String(e.id), e]));
-  $$('tr[data-id]', main).forEach((tr) => tr.addEventListener('click', () => modal(byId.get(tr.dataset.id))));
+  $$('tr[data-id]', main).forEach((tr) => tr.addEventListener('click', () => {
+    const e = byId.get(tr.dataset.id);
+    if (e.origin === 'sheet') fromSheetToast(e);
+    else modal(e);
+  }));
 }
 
 // ---- payroll ----------------------------------------------------------------------------
@@ -1081,9 +1156,10 @@ async function pageTeam(main) {
 // ---- settings ----------------------------------------------------------------------------
 
 async function pageSettings(main) {
-  const { settings: s } = await api('/settings');
+  const [{ settings: s }, sh] = await Promise.all([api('/settings'), api('/sheets')]);
   main.innerHTML = html`
     <div class="page-head"><div><h1>Settings</h1></div></div>
+    ${sheetsCard(sh)}
     <form class="card stack" id="settings-form" style="max-width:640px">
       <label class="field">Business name<input name="business_name" value="${s.business_name}" required></label>
       <label class="field">Pay week starts on<select name="week_start">${DOW.map((d, i) => html`<option value="${i}" ${String(i) === s.week_start ? 'selected' : ''}>${d}</option>`)}</select></label>
@@ -1098,6 +1174,7 @@ async function pageSettings(main) {
       <div class="error" role="alert"></div>
       <div><button class="btn primary" type="submit">Save settings</button></div>
     </form>`.s;
+  bindSheetsCard(main, () => pageSettings(main));
   const form = $('#settings-form');
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1111,6 +1188,71 @@ async function pageSettings(main) {
       $('#app').innerHTML = '';
       renderApp();
       toast('Settings saved');
+    } catch (err) {
+      $('.error', form).textContent = err.message;
+    }
+  });
+}
+
+function sheetsCard(sh) {
+  const last = sh.last;
+  const linkedAny = Object.values(sh.urls).some(Boolean);
+  return html`
+    <form class="card stack" id="sheets-form" style="max-width:860px;margin-bottom:16px">
+      <div class="card-head" style="margin:0"><h2>Google Sheets</h2>
+        <span class="hint">${linkedAny ? `Last synced ${timeAgo(last?.at)}` : 'Not connected'}</span></div>
+      <p class="muted small" style="margin:0">Paste the link to each tab that holds your data. Open the tab in Google Sheets and copy the address bar, so the link ends in <code>#gid=…</code>.
+        Linked sections are read from the sheet and can't be edited in the app. Leave a link blank to keep managing that section here.
+        The first row of each tab must be column headings (for example <em>Title, Author, SKU, Qty, Cost, Price</em> · <em>Date, Platform, Title, Sale Price, Fees, Postage</em> · <em>Date, Category, Vendor, Amount</em>).</p>
+      ${sh.serviceAccountEmail
+        ? html`<div class="sheet-banner"><span class="sheet-icon" aria-hidden="true">🔒</span><span>Private access is set up. Share your sheet (Viewer) with <strong>${sh.serviceAccountEmail}</strong>.</span></div>`
+        : sh.serviceAccountError
+          ? html`<div class="alert"><span>⚠</span><span>${sh.serviceAccountError}</span></div>`
+          : html`<div class="sheet-banner"><span class="sheet-icon" aria-hidden="true">🔗</span><span>The sheet must be shared as <strong>“Anyone with the link can view”</strong>. To keep it private instead, set up a Google service account (see the README).</span></div>`}
+      ${SECTIONS_LIST.map((k) => html`<label class="field">${SECTION_LABEL[k]} tab link
+        <input name="${k}" value="${sh.urls[k]}" placeholder="https://docs.google.com/spreadsheets/d/…/edit#gid=…" inputmode="url"></label>
+        ${last?.sections?.[k] ? syncResult(last.sections[k]) : ''}
+        ${sh.appRows?.[k] ? html`<div class="alert" style="margin:0"><span>ⓘ</span><span>${sh.appRows[k]} ${k === 'inventory' ? 'books were' : `${k} were`} entered in the app before linking and still count alongside the sheet.
+          If your sheet already has them, <button type="button" class="btn link small" data-clear="${k}">remove the app-entered ${k === 'inventory' ? 'books' : k}</button>.</span></div>` : ''}`)}
+      <label class="field" style="max-width:260px">Sync automatically every
+        <select name="autoMinutes">${[[0, 'Off (manual only)'], [5, '5 minutes'], [15, '15 minutes'], [30, '30 minutes'], [60, 'hour'], [240, '4 hours']].map(([v, l]) => html`<option value="${v}" ${sh.autoMinutes === v ? 'selected' : ''}>${l}</option>`)}</select></label>
+      <div class="error" role="alert"></div>
+      <div class="row"><button class="btn primary" type="submit">Save &amp; sync</button>
+        ${linkedAny ? html`<button class="btn" type="button" data-sync>Sync now</button>` : ''}</div>
+    </form>`;
+}
+const SECTIONS_LIST = ['inventory', 'sales', 'expenses'];
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+function syncResult(r) {
+  if (!r.ok) return html`<div class="alert" style="margin:0"><span>⚠</span><span><strong>Last sync failed:</strong> ${r.error}</span></div>`;
+  return html`<details class="sync-result"><summary><span class="pill good">✓ ${plural(r.imported, 'row')} imported</span>
+      ${r.skipped.count ? html` <span class="pill warn">${plural(r.skipped.count, 'row')} skipped</span>` : ''}${r.removed ? html` <span class="pill">${r.removed} removed from sheet</span>` : ''} <span class="small muted">details</span></summary>
+    <div class="small" style="margin-top:6px"><strong>Columns used:</strong> ${Object.values(r.matched).join(', ')}</div>
+    ${r.ignored.length ? html`<div class="small muted"><strong>Columns ignored:</strong> ${r.ignored.join(', ')}</div>` : ''}
+    ${r.skipped.rows.map((x) => html`<div class="small">Row ${x.row}: ${x.reason}</div>`)}
+    ${r.skipped.count > r.skipped.rows.length ? html`<div class="small muted">…and ${r.skipped.count - r.skipped.rows.length} more</div>` : ''}
+  </details>`;
+}
+
+function bindSheetsCard(main, reload) {
+  bindSheetBanner(main, reload);
+  $$('[data-clear]', main).forEach((b) => b.addEventListener('click', async () => {
+    const k = b.dataset.clear;
+    if (!(await confirmModal(`Remove app-entered ${k === 'inventory' ? 'books' : k}?`, `This permanently deletes the ${k === 'inventory' ? 'books' : k} that were typed into the app. Everything from your Google Sheet stays.`, 'Remove'))) return;
+    const r = await api('/sheets/clear-app', { method: 'POST', body: { section: k } });
+    toast(`Removed ${r.deleted}`);
+    reload();
+  }));
+  const form = $('#sheets-form');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const v = Object.fromEntries(new FormData(form));
+    try {
+      await api('/sheets', { method: 'PUT', body: { urls: { inventory: v.inventory, sales: v.sales, expenses: v.expenses }, autoMinutes: Number(v.autoMinutes) } });
+      await refreshStatus();
+      if (SECTIONS_LIST.some((k) => v[k])) await runSync(reload, $('button[type=submit]', form));
+      else { toast('Google Sheets disconnected'); reload(); }
     } catch (err) {
       $('.error', form).textContent = err.message;
     }
