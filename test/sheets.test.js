@@ -143,7 +143,7 @@ test('syncs privately with a service account', async () => {
     if (u.startsWith('https://oauth2.googleapis.com/token')) {
       const jwt = new URLSearchParams(String(opts.body)).get('assertion').split('.');
       assert.ok(crypto.verify('RSA-SHA256', Buffer.from(`${jwt[0]}.${jwt[1]}`), publicKey, Buffer.from(jwt[2], 'base64url')));
-      assert.equal(JSON.parse(Buffer.from(jwt[1], 'base64url')).scope, 'https://www.googleapis.com/auth/spreadsheets.readonly');
+      assert.equal(JSON.parse(Buffer.from(jwt[1], 'base64url')).scope, 'https://www.googleapis.com/auth/spreadsheets');
       return Response.json({ access_token: 'tok', expires_in: 3600 });
     }
     assert.equal(opts.headers.Authorization, 'Bearer tok');

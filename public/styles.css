@@ -392,3 +392,14 @@ dialog form.modal { display: flex; flex-direction: column; max-height: calc(100v
   .lister-actions .btn { flex: 1; }
   .photo, .photo-add { width: 88px; height: 116px; }
 }
+
+/* ---- settings: sheets ---- */
+.setup-guide { background: var(--surface-2); border-radius: 12px; padding: 12px 16px; }
+.setup-guide summary { cursor: pointer; }
+.setup-guide ol { margin: 10px 0 2px; padding-left: 20px; display: grid; gap: 8px; font-size: .92rem; color: var(--text-2); }
+.setup-guide strong { color: var(--text); }
+.copyable { user-select: all; background: var(--surface); padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); }
+.switch-row { display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; }
+.switch-row input { margin-top: 4px; width: 18px; height: 18px; }
+.switch-row.disabled { opacity: .6; cursor: default; }
+.switch-row .muted { display: block; margin-top: 2px; }

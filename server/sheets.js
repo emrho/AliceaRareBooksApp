@@ -8,6 +8,9 @@
 //
 // The sheet is the source of truth: rows imported from it are marked origin = 'sheet' and are
 // replaced on every sync. Rows entered in the app (origin = 'app') are left alone.
+// With two-way sync on (service account with Editor access), changes made in the app are
+// marked sheet_dirty = 1 and written to the sheet first (see sheets-writer.js); a sync never
+// overwrites a row that still has unsent changes.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -65,12 +68,13 @@ export function serviceAccount(env = process.env) {
 const b64url = (buf) => Buffer.from(buf).toString('base64url');
 let cachedToken = null;
 
-async function accessToken(sa, fetchImpl) {
+export async function accessToken(sa, fetchImpl) {
   if (cachedToken && cachedToken.email === sa.client_email && cachedToken.expires > Date.now() + 60000) return cachedToken.token;
   const now = Math.floor(Date.now() / 1000);
   const head = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
   const claims = b64url(JSON.stringify({
-    iss: sa.client_email, scope: 'https://www.googleapis.com/auth/spreadsheets.readonly',
+    // Full scope so two-way sync can write; access is still limited to sheets shared with the account.
+    iss: sa.client_email, scope: 'https://www.googleapis.com/auth/spreadsheets',
     aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600,
   }));
   const sig = b64url(crypto.sign('RSA-SHA256', Buffer.from(`${head}.${claims}`), sa.private_key));
@@ -85,27 +89,67 @@ async function accessToken(sa, fetchImpl) {
   return cachedToken.token;
 }
 
+/**
+ * A connection to one tab through the Sheets API (service account only).
+ * read() -> rows; writeCells([{ row, col, value }]) (1-based); deleteRows([rowNums]).
+ */
+export async function openTab(ref, { fetchImpl = fetch, sa }) {
+  const token = await accessToken(sa, fetchImpl);
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  const base = `https://sheets.googleapis.com/v4/spreadsheets/${ref.id}`;
+  const call = async (url, init = {}) => {
+    const res = await fetchImpl(url, { ...init, headers });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 403 || res.status === 404) {
+      const write = init.method === 'POST';
+      throw new Error(write
+        ? `The app can't edit the sheet. Share it with ${sa.client_email} as an Editor (not Viewer).`
+        : `The sheet isn't shared with ${sa.client_email}. Open the sheet, click Share, and add that email.`);
+    }
+    if (!res.ok) throw new Error(`Google Sheets error: ${data.error?.message || res.status}`);
+    return data;
+  };
+  const meta = await call(`${base}?fields=sheets.properties(sheetId,title)`);
+  const tab = meta.sheets?.find((t) => String(t.properties.sheetId) === ref.gid);
+  if (!tab) throw new Error('That tab no longer exists in the sheet (check the link\'s #gid=)');
+  const quoted = `'${tab.properties.title.replace(/'/g, "''")}'`;
+  return {
+    title: tab.properties.title,
+    async read() {
+      const vals = await call(`${base}/values/${encodeURIComponent(quoted)}?valueRenderOption=FORMATTED_VALUE&majorDimension=ROWS`);
+      return (vals.values || []).map((r) => r.map((c) => String(c ?? '')));
+    },
+    async writeCells(cells) {
+      if (!cells.length) return;
+      await call(`${base}/values:batchUpdate`, {
+        method: 'POST',
+        body: JSON.stringify({
+          valueInputOption: 'USER_ENTERED',
+          data: cells.map((c) => ({ range: `${quoted}!${columnLetter(c.col)}${c.row}`, values: [[c.value]] })),
+        }),
+      });
+    },
+    async deleteRows(rowNums) {
+      if (!rowNums.length) return;
+      const requests = [...new Set(rowNums)].sort((a, b) => b - a).map((r) => ({
+        deleteDimension: { range: { sheetId: Number(ref.gid), dimension: 'ROWS', startIndex: r - 1, endIndex: r } },
+      }));
+      await call(`${base}:batchUpdate`, { method: 'POST', body: JSON.stringify({ requests }) });
+    },
+  };
+}
+
+/** 1 -> A, 27 -> AA */
+export function columnLetter(n) {
+  let s = '';
+  for (; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
+  return s;
+}
+
 /** Returns the tab as an array of rows (arrays of strings). */
 export async function fetchTab(ref, { fetchImpl = fetch, sa = serviceAccount() } = {}) {
   if (sa?.error) throw new Error(sa.error);
-  if (sa) {
-    const token = await accessToken(sa, fetchImpl);
-    const auth = { headers: { Authorization: `Bearer ${token}` } };
-    const base = `https://sheets.googleapis.com/v4/spreadsheets/${ref.id}`;
-    const metaRes = await fetchImpl(`${base}?fields=sheets.properties(sheetId,title)`, auth);
-    const meta = await metaRes.json().catch(() => ({}));
-    if (metaRes.status === 403 || metaRes.status === 404) {
-      throw new Error(`The sheet isn't shared with ${sa.client_email}. Open the sheet, click Share, and add that email as a Viewer.`);
-    }
-    if (!metaRes.ok) throw new Error(`Google Sheets error: ${meta.error?.message || metaRes.status}`);
-    const tab = meta.sheets?.find((s) => String(s.properties.sheetId) === ref.gid);
-    if (!tab) throw new Error('That tab no longer exists in the sheet (check the link\'s #gid=)');
-    const range = encodeURIComponent(`'${tab.properties.title.replace(/'/g, "''")}'`);
-    const valRes = await fetchImpl(`${base}/values/${range}?valueRenderOption=FORMATTED_VALUE&majorDimension=ROWS`, auth);
-    const vals = await valRes.json().catch(() => ({}));
-    if (!valRes.ok) throw new Error(`Google Sheets error: ${vals.error?.message || valRes.status}`);
-    return (vals.values || []).map((r) => r.map((c) => String(c ?? '')));
-  }
+  if (sa) return (await openTab(ref, { fetchImpl, sa })).read();
   const res = await fetchImpl(`https://docs.google.com/spreadsheets/d/${ref.id}/export?format=csv&gid=${ref.gid}`, { redirect: 'follow' });
   const type = res.headers.get('content-type') || '';
   if (!res.ok || !type.includes('csv')) {
@@ -213,6 +257,7 @@ export const COLUMNS = {
     cost: ['cost', 'cogs', 'costofgoods', 'bookcost', 'paid', 'purchaseprice', 'mycost'],
     order_ref: ['ordernumber', 'order', 'orderid', 'orderno', 'transactionid'],
     notes: ['notes', 'note', 'comments', 'comment', 'buyer'],
+    app_id: ['appid', 'appkey', 'recordid'],
   },
   expenses: {
     expense_date: ['date', 'expensedate', 'datepaid', 'purchasedate', 'transactiondate'],
@@ -220,7 +265,20 @@ export const COLUMNS = {
     vendor: ['vendor', 'payee', 'store', 'merchant', 'paidto', 'company', 'where', 'from'],
     amount: ['amount', 'total', 'cost', 'price', 'paid', 'amountpaid'],
     notes: ['notes', 'description', 'memo', 'item', 'details', 'for', 'note', 'comments'],
+    app_id: ['appid', 'appkey', 'recordid'],
   },
+};
+
+/** Column headings the app writes into an empty tab (two-way sync). */
+export const DEFAULT_HEADERS = {
+  inventory: [['sku', 'SKU'], ['title', 'Title'], ['author', 'Author'], ['isbn', 'ISBN'], ['publisher', 'Publisher'], ['pub_year', 'Year'],
+    ['edition', 'Edition'], ['binding', 'Binding'], ['condition', 'Condition'], ['location', 'Shelf'], ['quantity', 'Qty'], ['cost', 'Cost'],
+    ['list_price', 'Price'], ['acquired_date', 'Acquired'], ['source', 'Source'], ['ebay', 'eBay'], ['whatnot', 'Whatnot'], ['amazon', 'Amazon'],
+    ['status', 'Status'], ['description', 'Description'], ['notes', 'Notes']],
+  sales: [['sale_date', 'Date'], ['channel', 'Platform'], ['sku', 'SKU'], ['title', 'Title'], ['quantity', 'Qty'], ['sale_price', 'Sale Price'],
+    ['shipping_charged', 'Shipping Charged'], ['platform_fees', 'Fees'], ['shipping_cost', 'Postage'], ['cost', 'Cost'], ['order_ref', 'Order #'],
+    ['notes', 'Notes'], ['app_id', 'App ID']],
+  expenses: [['expense_date', 'Date'], ['category', 'Category'], ['vendor', 'Vendor'], ['amount', 'Amount'], ['notes', 'Notes'], ['app_id', 'App ID']],
 };
 const REQUIRED = { inventory: ['title'], sales: ['sale_date', 'sale_price'], expenses: ['expense_date', 'amount'] };
 const LABELS = {
@@ -230,7 +288,7 @@ const LABELS = {
 /** Finds the header row and maps our fields to column indexes. */
 export function mapColumns(section, rows) {
   const headerIdx = rows.findIndex((r) => r.some((c) => String(c).trim()));
-  if (headerIdx < 0) throw new Error('The tab is empty');
+  if (headerIdx < 0) return { empty: true, headerIdx: -1, map: {}, matched: {}, ignored: [] };
   const headers = rows[headerIdx].map(norm);
   const used = new Set();
   const map = {};
@@ -272,7 +330,8 @@ function* dataRows(rows, headerIdx, map) {
 const has = (v) => v !== undefined && v !== '';
 
 export function importInventory(db, rows) {
-  const { headerIdx, map, matched, ignored } = mapColumns('inventory', rows);
+  const { headerIdx, map, matched, ignored, empty } = mapColumns('inventory', rows);
+  if (empty) return { imported: 0, removed: 0, skipped: [], matched, ignored, empty: true };
   const soldColumn = norm(matched.status) === 'sold'; // a yes/no "Sold" column rather than a status
   const skipped = [];
   const books = [];
@@ -316,19 +375,35 @@ export function importInventory(db, rows) {
   }
 
   const cols = Object.keys(books[0] || { sku: 1 });
+  // On existing books, only overwrite what the sheet actually has a column for, so details kept
+  // only in the app (photos aside: eBay listing IDs, shelf, etc.) survive a sync.
+  const FIELD_COLUMNS = {
+    author: 'author', isbn: 'isbn', publisher: 'publisher', pub_year: 'pub_year', edition: 'edition', binding: 'binding',
+    condition: 'condition', description: 'description', location: 'location', cost_cents: 'cost', list_price_cents: 'list_price',
+    acquired_date: 'acquired_date', source: 'source', notes: 'notes',
+    ebay_listed: ['ebay', 'listed_on'], ebay_ref: 'ebay', whatnot_listed: ['whatnot', 'listed_on'], whatnot_ref: 'whatnot',
+    amazon_listed: ['amazon', 'listed_on'], amazon_ref: 'amazon', quantity: ['quantity', 'status'], archived: 'status',
+  };
+  const present = (c) => {
+    if (['sku', 'title', 'sheet_row'].includes(c)) return true;
+    const f = FIELD_COLUMNS[c];
+    return [].concat(f || []).some((x) => map[x] !== undefined);
+  };
+  const updCols = cols.filter(present);
   let removed = 0;
   tx(db, () => {
-    const find = db.prepare('SELECT id FROM books WHERE sku = ?');
+    const find = db.prepare('SELECT id, sheet_dirty FROM books WHERE sku = ?');
     const ins = db.prepare(`INSERT INTO books (${cols.join(',')}, origin) VALUES (${cols.map(() => '?').join(',')}, 'sheet')`);
-    const upd = db.prepare(`UPDATE books SET ${cols.map((c) => `${c} = ?`).join(', ')}, origin = 'sheet', updated_at = datetime('now') WHERE id = ?`);
+    const upd = db.prepare(`UPDATE books SET ${updCols.map((c) => `${c} = ?`).join(', ')}, origin = 'sheet', updated_at = datetime('now') WHERE id = ?`);
     for (const b of books) {
       const existing = find.get(b.sku);
-      if (existing) upd.run(...cols.map((c) => b[c]), existing.id);
+      if (existing?.sheet_dirty) continue; // has unsent app changes; the next push wins
+      if (existing) upd.run(...updCols.map((c) => b[c]), existing.id);
       else ins.run(...cols.map((c) => b[c]));
     }
     // Books that were removed from the sheet: delete, or archive if sales point at them.
     const keep = new Set(books.map((b) => b.sku.toLowerCase()));
-    for (const old of db.prepare(`SELECT id, sku FROM books WHERE origin = 'sheet'`).all()) {
+    for (const old of db.prepare(`SELECT id, sku FROM books WHERE origin = 'sheet' AND sheet_dirty = 0`).all()) {
       if (keep.has(old.sku.toLowerCase())) continue;
       const used = db.prepare('SELECT 1 FROM sales WHERE book_id = ? LIMIT 1').get(old.id);
       if (used) db.prepare(`UPDATE books SET archived = 1, quantity = 0, updated_at = datetime('now') WHERE id = ?`).run(old.id);
@@ -340,7 +415,8 @@ export function importInventory(db, rows) {
 }
 
 export function importSales(db, rows) {
-  const { headerIdx, map, matched, ignored } = mapColumns('sales', rows);
+  const { headerIdx, map, matched, ignored, empty } = mapColumns('sales', rows);
+  if (empty) return replaceRows(db, 'sales', [], { matched, ignored, empty });
   const skipped = [];
   const sales = [];
   const bySku = db.prepare('SELECT id, title, cost_cents FROM books WHERE sku = ?');
@@ -360,22 +436,40 @@ export function importSales(db, rows) {
       const cost = has(get('cost')) ? parseMoney(get('cost')) : (book ? book.cost_cents * quantity : 0);
       sales.push([book?.id ?? null, title.slice(0, 300), parseChannel(get('channel')), sale_date, quantity,
         parseMoney(get('sale_price')), parseMoney(get('shipping_charged')), Math.abs(parseMoney(get('platform_fees'))),
-        Math.abs(parseMoney(get('shipping_cost'))), cost, (get('order_ref') || '').slice(0, 200), (get('notes') || '').slice(0, 2000), rowNum]);
+        Math.abs(parseMoney(get('shipping_cost'))), cost, (get('order_ref') || '').slice(0, 200), (get('notes') || '').slice(0, 2000), rowNum,
+        (get('app_id') || '').slice(0, 40)]);
     } catch (err) {
       skipped.push({ row: rowNum, reason: err.message });
     }
   }
+  return replaceRows(db, 'sales', sales, { skipped, matched, ignored });
+}
+
+const INSERT_SQL = {
+  sales: `INSERT INTO sales (book_id, title, channel, sale_date, quantity, sale_price_cents, shipping_charged_cents,
+    platform_fees_cents, shipping_cost_cents, cost_cents, order_ref, notes, sheet_row, sheet_key, origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'sheet')`,
+  expenses: `INSERT INTO expenses (expense_date, category, vendor, amount_cents, notes, sheet_row, sheet_key, origin) VALUES (?,?,?,?,?,?,?,'sheet')`,
+};
+
+/**
+ * Replaces the sheet-sourced rows of a table with what the sheet holds now. Rows with unsent
+ * app changes (or pending deletes) are kept as they are, and the sheet's copy is skipped.
+ */
+function replaceRows(db, table, rows, info) {
+  const keyIdx = table === 'sales' ? 13 : 6;
   tx(db, () => {
-    db.prepare(`DELETE FROM sales WHERE origin = 'sheet'`).run();
-    const ins = db.prepare(`INSERT INTO sales (book_id, title, channel, sale_date, quantity, sale_price_cents, shipping_charged_cents,
-      platform_fees_cents, shipping_cost_cents, cost_cents, order_ref, notes, sheet_row, origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'sheet')`);
-    for (const s of sales) ins.run(...s);
+    const dirty = new Set(db.prepare(`SELECT sheet_key FROM ${table} WHERE sheet_dirty = 1 AND sheet_key != ''`).all().map((r) => r.sheet_key));
+    for (const d of db.prepare(`SELECT key FROM sheet_deletes WHERE section = ?`).all(table)) dirty.add(d.key);
+    db.prepare(`DELETE FROM ${table} WHERE origin = 'sheet' AND sheet_dirty = 0`).run();
+    const ins = db.prepare(INSERT_SQL[table]);
+    for (const r of rows) if (!(r[keyIdx] && dirty.has(r[keyIdx]))) ins.run(...r);
   });
-  return { imported: sales.length, skipped, matched, ignored };
+  return { imported: rows.length, skipped: info.skipped || [], matched: info.matched, ignored: info.ignored, ...(info.empty && { empty: true }) };
 }
 
 export function importExpenses(db, rows) {
-  const { headerIdx, map, matched, ignored } = mapColumns('expenses', rows);
+  const { headerIdx, map, matched, ignored, empty } = mapColumns('expenses', rows);
+  if (empty) return replaceRows(db, 'expenses', [], { matched, ignored, empty });
   const skipped = [];
   const expenses = [];
   for (const { rowNum, get } of dataRows(rows, headerIdx, map)) {
@@ -384,17 +478,12 @@ export function importExpenses(db, rows) {
       if (!date) throw new Error('no date');
       if (!has(get('amount'))) throw new Error('no amount');
       expenses.push([date, (get('category') || 'Other').slice(0, 100), (get('vendor') || '').slice(0, 200),
-        Math.abs(parseMoney(get('amount'))), (get('notes') || '').slice(0, 2000), rowNum]);
+        Math.abs(parseMoney(get('amount'))), (get('notes') || '').slice(0, 2000), rowNum, (get('app_id') || '').slice(0, 40)]);
     } catch (err) {
       skipped.push({ row: rowNum, reason: err.message });
     }
   }
-  tx(db, () => {
-    db.prepare(`DELETE FROM expenses WHERE origin = 'sheet'`).run();
-    const ins = db.prepare(`INSERT INTO expenses (expense_date, category, vendor, amount_cents, notes, sheet_row, origin) VALUES (?,?,?,?,?,?,'sheet')`);
-    for (const e of expenses) ins.run(...e);
-  });
-  return { imported: expenses.length, skipped, matched, ignored };
+  return replaceRows(db, 'expenses', expenses, { skipped, matched, ignored });
 }
 
 const IMPORTERS = { inventory: importInventory, sales: importSales, expenses: importExpenses };

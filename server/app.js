@@ -7,6 +7,7 @@ import {
   addDays, computePay, entryHours, isValidDate, isValidTimestamp, nowLocal, todayLocal, weekStartOf,
 } from './payroll.js';
 import { SECTIONS, parseSheetUrl, serviceAccount, syncAll } from './sheets.js';
+import { TABLE as SHEET_TABLE, newKey, pendingCounts, pushAll } from './sheets-writer.js';
 import { AiError, hasAiCredentials, identifyBook, AI_MODEL } from './ai.js';
 import {
   CATEGORIES, CONDITIONS, EbayClient, EbayError, bookAspects, conditionFromGrade, descriptionHtml, ebayConfig,
@@ -135,12 +136,31 @@ export function createApp(db, {
     sales: 'Sales come from your Google Sheet. Make this change in the sheet, then sync.',
     expenses: 'Expenses come from your Google Sheet. Make this change in the sheet, then sync.',
   };
+  // Two-way sync needs a service account (Editor access); a link-shared sheet is read-only.
+  const canWrite = () => { const sa = serviceAccount(env); return !!sa && !sa.error; };
+  const writeBack = (settings = getSettings(db)) => settings.sheets_write_back === '1' && canWrite();
   const fromSheet = (section, row) => {
-    if (row?.origin === 'sheet') throw new ApiError(409, LINKED_MSG[section]);
+    if (row?.origin === 'sheet' && !writeBack()) throw new ApiError(409, LINKED_MSG[section]);
   };
   const notLinked = (section) => {
-    if (linked(section)) throw new ApiError(409, LINKED_MSG[section]);
+    if (linked(section) && !writeBack()) throw new ApiError(409, LINKED_MSG[section]);
   };
+
+  /** Queues a changed record to be written to the sheet (two-way sync). */
+  function touch(section, id) {
+    if (!id || !linked(section) || !writeBack()) return;
+    db.prepare(`UPDATE ${SHEET_TABLE[section]} SET sheet_dirty = sheet_dirty + 1,
+      sheet_key = CASE WHEN sheet_key = '' THEN ? ELSE sheet_key END WHERE id = ?`).run(newKey(), id);
+    schedulePush();
+  }
+  /** Queues deleting a record's row from the sheet. Call before deleting it locally. */
+  function touchDelete(section, row) {
+    if (!row || row.origin !== 'sheet' || !linked(section) || !writeBack()) return;
+    const key = section === 'inventory' ? row.sku : row.sheet_key;
+    const check = section === 'inventory' ? row.title : row.sale_date || row.expense_date;
+    db.prepare('INSERT INTO sheet_deletes (section, key, sheet_row, check_text) VALUES (?, ?, ?, ?)').run(SHEET_TABLE[section], key || '', row.sheet_row, check);
+    schedulePush();
+  }
 
   function lastSync(settings) {
     try { return JSON.parse(settings.sheets_last_result || 'null'); } catch { return null; }
@@ -148,7 +168,13 @@ export function createApp(db, {
 
   function sheetsStatus(settings, isOwnerUser) {
     const last = lastSync(settings);
-    const out = { lastSyncAt: last?.at || null, lastOk: last ? last.ok : null };
+    let push = null;
+    try { push = JSON.parse(settings.sheets_last_push || 'null'); } catch { /* ignore */ }
+    const pending = pendingCounts(db);
+    const out = {
+      lastSyncAt: last?.at || null, lastOk: last ? last.ok : null, writeBack: writeBack(settings),
+      pending: Object.values(pending).reduce((a, b) => a + b, 0), pushOk: push ? push.ok : null,
+    };
     for (const sec of SECTIONS) {
       out[sec] = linked(sec, settings);
       if (isOwnerUser && out[sec]) out[`${sec}Url`] = settings[`sheets_${sec}_url`];
@@ -156,21 +182,44 @@ export function createApp(db, {
     return out;
   }
 
+  // Pushes and pulls never overlap: each waits for the one before it.
+  let queue = Promise.resolve();
+  const exclusive = (fn) => { const run = queue.then(fn, fn); queue = run.catch(() => {}); return run; };
+  const sheetUrls = (settings = getSettings(db)) => Object.fromEntries(SECTIONS.map((sec) => [sec, settings[`sheets_${sec}_url`]]));
+  const sheetOpts = () => ({ ...(fetchImpl && { fetchImpl }), sa: serviceAccount(env) });
+
+  /** Writes queued app changes to the sheet. */
+  function pushSheets() {
+    return exclusive(async () => {
+      if (!writeBack()) return null;
+      const result = await pushAll(db, sheetUrls(), sheetOpts());
+      db.prepare(`UPDATE settings SET value = ? WHERE key = 'sheets_last_push'`).run(JSON.stringify(result));
+      return result;
+    });
+  }
+  let pushTimer = null;
+  function schedulePush() {
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(() => { pushSheets().catch((err) => console.warn('Sheet write-back failed:', err.message)); }, 1500);
+    pushTimer.unref?.();
+  }
+
   let syncing = null;
-  /** Runs one sync at a time; concurrent callers share the in-flight run. */
+  /** Full sync: send app changes first (two-way), then read the sheet. Concurrent callers share one run. */
   function syncSheets() {
     if (syncing) return syncing;
-    const settings = getSettings(db);
-    const urls = Object.fromEntries(SECTIONS.map((sec) => [sec, settings[`sheets_${sec}_url`]]));
-    syncing = syncAll(db, urls, { ...(fetchImpl && { fetchImpl }), sa: serviceAccount(env) })
-      .then((result) => {
-        db.prepare(`UPDATE settings SET value = ? WHERE key = 'sheets_last_result'`).run(JSON.stringify(result));
-        return result;
-      })
-      .finally(() => { syncing = null; });
+    syncing = (async () => {
+      const push = writeBack() ? await pushSheets() : null;
+      const result = await exclusive(() => syncAll(db, sheetUrls(), sheetOpts()));
+      if (push) result.push = push;
+      if (push && !push.ok) result.ok = false;
+      db.prepare(`UPDATE settings SET value = ? WHERE key = 'sheets_last_result'`).run(JSON.stringify(result));
+      return result;
+    })().finally(() => { syncing = null; });
     return syncing;
   }
   app.locals.syncSheets = syncSheets;
+  app.locals.pushSheets = pushSheets;
   app.locals.sheetsLinked = () => SECTIONS.some((sec) => linked(sec));
 
   // Reject cross-site form posts: every mutating API call must be JSON.
@@ -319,27 +368,34 @@ export function createApp(db, {
     const cols = Object.keys(b);
     const id = uniqueSku(() => db.prepare(`INSERT INTO books (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`)
       .run(...cols.map((c) => b[c])).lastInsertRowid);
+    touch('inventory', id);
     res.status(201).json({ book: db.prepare('SELECT * FROM books WHERE id = ?').get(id) });
   });
 
   app.put('/api/books/:id', auth, (req, res) => {
-    const existing = db.prepare('SELECT id, origin FROM books WHERE id = ?').get(req.params.id);
+    const existing = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
     if (!existing) throw new ApiError(404, 'Book not found');
     fromSheet('inventory', existing);
     const b = readBook(req.body);
     const cols = Object.keys(b);
     uniqueSku(() => db.prepare(`UPDATE books SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ?`)
       .run(...cols.map((c) => b[c]), req.params.id));
+    // A changed SKU is a new key in the sheet: remove the old row's key mapping by deleting it and appending.
+    if (existing.origin === 'sheet' && b.sku.toLowerCase() !== existing.sku.toLowerCase()) touchDelete('inventory', existing);
+    touch('inventory', existing.id);
     res.json({ book: db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id) });
   });
 
   app.delete('/api/books/:id', auth, ownerOnly, (req, res) => {
-    fromSheet('inventory', db.prepare('SELECT origin FROM books WHERE id = ?').get(req.params.id));
+    const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
+    fromSheet('inventory', book);
     const used = db.prepare('SELECT COUNT(*) AS n FROM sales WHERE book_id = ?').get(req.params.id).n;
     if (used) {
       db.prepare(`UPDATE books SET archived = 1, updated_at = datetime('now') WHERE id = ?`).run(req.params.id);
+      touch('inventory', book.id);
       return res.json({ archived: true });
     }
+    touchDelete('inventory', book);
     const photoIds = bookPhotos(req.params.id).map((p) => p.id);
     const r = db.prepare('DELETE FROM books WHERE id = ?').run(req.params.id);
     if (!r.changes) throw new ApiError(404, 'Book not found');
@@ -401,6 +457,8 @@ export function createApp(db, {
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(bookId, title, s.channel, s.sale_date, quantity, s.sale_price_cents,
         s.shipping_charged_cents, s.platform_fees_cents, s.shipping_cost_cents, cost, s.order_ref, s.notes, req.user.id).lastInsertRowid;
     });
+    touch('sales', id);
+    touch('inventory', bookId);
     const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(id);
     const book = bookId ? db.prepare('SELECT * FROM books WHERE id = ?').get(bookId) : null;
     // Selling the last copy on one channel means the other listings must come down.
@@ -420,6 +478,7 @@ export function createApp(db, {
     db.prepare(`UPDATE sales SET channel=?, sale_date=?, sale_price_cents=?, shipping_charged_cents=?, platform_fees_cents=?,
       shipping_cost_cents=?, cost_cents=?, order_ref=?, notes=?, title=? WHERE id = ?`).run(s.channel, s.sale_date, s.sale_price_cents,
       s.shipping_charged_cents, s.platform_fees_cents, s.shipping_cost_cents, cost, s.order_ref, s.notes, title, req.params.id);
+    touch('sales', existing.id);
     res.json({ sale: db.prepare('SELECT * FROM sales WHERE id = ?').get(req.params.id) });
   });
 
@@ -430,7 +489,9 @@ export function createApp(db, {
       fromSheet('sales', sale);
       if (sale.book_id && req.body?.restock !== false) {
         db.prepare(`UPDATE books SET quantity = quantity + ?, updated_at = datetime('now') WHERE id = ?`).run(sale.quantity, sale.book_id);
+        touch('inventory', sale.book_id);
       }
+      touchDelete('sales', sale);
       db.prepare('DELETE FROM sales WHERE id = ?').run(sale.id);
     });
     res.json({ deleted: true });
@@ -459,6 +520,7 @@ export function createApp(db, {
     const e = readExpense(req.body);
     const id = db.prepare(`INSERT INTO expenses (expense_date, category, vendor, amount_cents, notes, created_by) VALUES (?,?,?,?,?,?)`)
       .run(e.expense_date, e.category, e.vendor, e.amount_cents, e.notes, req.user.id).lastInsertRowid;
+    touch('expenses', id);
     res.status(201).json({ expense: db.prepare('SELECT * FROM expenses WHERE id = ?').get(id) });
   });
 
@@ -468,11 +530,14 @@ export function createApp(db, {
     const r = db.prepare(`UPDATE expenses SET expense_date=?, category=?, vendor=?, amount_cents=?, notes=? WHERE id = ?`)
       .run(e.expense_date, e.category, e.vendor, e.amount_cents, e.notes, req.params.id);
     if (!r.changes) throw new ApiError(404, 'Expense not found');
+    touch('expenses', Number(req.params.id));
     res.json({ expense: db.prepare('SELECT * FROM expenses WHERE id = ?').get(req.params.id) });
   });
 
   app.delete('/api/expenses/:id', auth, ownerOnly, (req, res) => {
-    fromSheet('expenses', db.prepare('SELECT origin FROM expenses WHERE id = ?').get(req.params.id));
+    const expense = db.prepare('SELECT * FROM expenses WHERE id = ?').get(req.params.id);
+    fromSheet('expenses', expense);
+    touchDelete('expenses', expense);
     const r = db.prepare('DELETE FROM expenses WHERE id = ?').run(req.params.id);
     if (!r.changes) throw new ApiError(404, 'Expense not found');
     res.json({ deleted: true });
@@ -716,6 +781,9 @@ export function createApp(db, {
       autoMinutes: Number(settings.sheets_auto_minutes),
       serviceAccountEmail: sa && !sa.error ? sa.client_email : null,
       serviceAccountError: sa?.error || null,
+      writeBack: writeBack(settings),
+      pending: pendingCounts(db),
+      lastPush: (() => { try { return JSON.parse(settings.sheets_last_push || 'null'); } catch { return null; } })(),
       last: lastSync(settings),
       // Rows entered in the app that sit alongside a linked tab (they'd be counted twice
       // if the sheet holds the same history).
@@ -744,9 +812,26 @@ export function createApp(db, {
       }
     }
     if ('autoMinutes' in req.body) out.sheets_auto_minutes = String(int(req.body, 'autoMinutes', { max: 1440 }));
+    if ('writeBack' in req.body) {
+      if (req.body.writeBack && !canWrite()) throw bad('Two-way sync needs a Google service account (see README).');
+      out.sheets_write_back = req.body.writeBack ? '1' : '0';
+    }
     const upd = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
     tx(db, () => Object.entries(out).forEach(([k, v]) => upd.run(k, v)));
     res.json({ ok: true, sheets: sheetsStatus(getSettings(db), true) });
+  });
+
+  // Copies records that were entered in the app (before linking) into the sheet.
+  app.post('/api/sheets/export', auth, ownerOnly, async (req, res) => {
+    const sec = req.body.section;
+    if (!SECTIONS.includes(sec)) throw bad('Unknown section');
+    if (!linked(sec)) throw bad('Link this section to a sheet tab first');
+    if (!writeBack()) throw bad('Turn on two-way sync first');
+    const ids = db.prepare(`SELECT id FROM ${SHEET_TABLE[sec]} WHERE origin = 'app'`).all().map((r) => r.id);
+    tx(db, () => ids.forEach((id) => touch(sec, id)));
+    clearTimeout(pushTimer);
+    const result = await pushSheets();
+    res.json({ queued: ids.length, result });
   });
 
   app.post('/api/sheets/sync', auth, ownerOnly, async (req, res) => {
@@ -977,6 +1062,7 @@ export function createApp(db, {
     }, ebayPolicy());
     db.prepare(`UPDATE books SET ebay_listed = 1, ebay_ref = ?, ebay_offer_id = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(result.listingId, result.offerId, book.id);
+    touch('inventory', book.id);
     return result;
   }
 
@@ -990,6 +1076,7 @@ export function createApp(db, {
     if (!book.ebay_offer_id) throw bad('This book wasn\'t listed from this app, so end the listing on eBay directly.');
     await ebay.end(book.ebay_offer_id);
     db.prepare(`UPDATE books SET ebay_listed = 0, updated_at = datetime('now') WHERE id = ?`).run(book.id);
+    touch('inventory', book.id);
     res.json({ book: getBook(book.id) });
   }));
 
@@ -1015,6 +1102,7 @@ export function createApp(db, {
         .run(...cols.map((c) => b[c])).lastInsertRowid);
       book = getBook(id);
     }
+    touch('inventory', book.id);
     savePhotos(book.id, req.body.images || []);
     book = getBook(book.id);
     let listing = null;

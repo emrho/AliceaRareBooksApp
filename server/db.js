@@ -106,6 +106,16 @@ CREATE TABLE IF NOT EXISTS photos (
 );
 CREATE INDEX IF NOT EXISTS photos_book_idx ON photos(book_id, position);
 
+-- Rows deleted in the app that still need deleting from the Google Sheet (two-way sync).
+-- section is the table name; key is the SKU (books) or App ID (sales/expenses).
+CREATE TABLE IF NOT EXISTS sheet_deletes (
+  id INTEGER PRIMARY KEY,
+  section TEXT NOT NULL,
+  key TEXT NOT NULL,
+  sheet_row INTEGER,
+  check_text TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -125,6 +135,8 @@ export const DEFAULT_SETTINGS = {
   sheets_expenses_url: '',
   sheets_auto_minutes: '15',
   sheets_last_result: '',
+  sheets_write_back: '0',
+  sheets_last_push: '',
   // eBay account connection and listing defaults (see server/ebay.js).
   ebay_refresh_token: '',
   ebay_refresh_expires: '',
@@ -139,9 +151,11 @@ export const DEFAULT_SETTINGS = {
 // Columns added after the first release; ALTER TABLE them onto older databases.
 const ADDED_COLUMNS = {
   // origin: 'app' (entered here) or 'sheet' (imported from Google Sheets)
-  books: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER', ebay_offer_id: "TEXT NOT NULL DEFAULT ''" },
-  sales: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER' },
-  expenses: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER' },
+  // sheet_dirty: changed in the app, not yet written to the Google Sheet (two-way sync).
+  // sheet_key: the row's "App ID" in the sheet (sales and expenses).
+  books: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER', ebay_offer_id: "TEXT NOT NULL DEFAULT ''", sheet_dirty: 'INTEGER NOT NULL DEFAULT 0', sheet_key: "TEXT NOT NULL DEFAULT ''" },
+  sales: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER', sheet_dirty: 'INTEGER NOT NULL DEFAULT 0', sheet_key: "TEXT NOT NULL DEFAULT ''" },
+  expenses: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER', sheet_dirty: 'INTEGER NOT NULL DEFAULT 0', sheet_key: "TEXT NOT NULL DEFAULT ''" },
 };
 
 export const dataDir = (file = process.env.DB_PATH) => (file && file !== ':memory:' ? path.dirname(file) : path.join(process.cwd(), 'data'));

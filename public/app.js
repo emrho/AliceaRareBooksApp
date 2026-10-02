@@ -348,6 +348,8 @@ function changePasswordModal() {
 const SECTIONS_LINKED = (sh) => !!(sh && (sh.inventory || sh.sales || sh.expenses));
 const SECTION_LABEL = { inventory: 'Inventory', sales: 'Sales', expenses: 'Expenses' };
 const sheetLinked = (section) => !!state.sheets?.[section];
+/** Linked to a sheet without two-way sync: the app can only read this section. */
+const sheetReadOnly = (section) => sheetLinked(section) && !state.sheets?.writeBack;
 
 function timeAgo(iso) {
   if (!iso) return 'never';
@@ -381,10 +383,14 @@ async function runSync(reload, btn) {
 function sheetBanner(section) {
   if (!sheetLinked(section)) return '';
   const url = state.sheets[`${section}Url`];
+  const what = { inventory: 'Inventory', sales: 'Sales', expenses: 'Expenses' }[section];
+  const sh = state.sheets;
   return html`<div class="sheet-banner">
-    <span class="sheet-icon" aria-hidden="true">▦</span>
-    <span>${SECTION_LABEL[section]} ${section === 'inventory' ? 'comes' : 'come'} from your Google Sheet. Add or change ${section === 'inventory' ? 'books' : section} there.
-      <span class="muted">Last synced ${timeAgo(state.sheets.lastSyncAt)}${state.sheets.lastOk === false ? ' (with problems — see Settings)' : ''}.</span></span>
+    <span class="sheet-icon" aria-hidden="true">${sh.writeBack ? '⇄' : '▦'}</span>
+    <span>${sh.writeBack
+      ? html`${what} ${section === 'inventory' ? 'is' : 'are'} synced both ways with your Google Sheet: changes here are saved to the sheet, and changes in the sheet show up here.`
+      : html`${what} ${section === 'inventory' ? 'comes' : 'come'} from your Google Sheet. Add or change ${section === 'inventory' ? 'books' : section} there.`}
+      <span class="muted">Last synced ${timeAgo(sh.lastSyncAt)}${sh.pending ? ` · ${sh.pending} change${sh.pending === 1 ? '' : 's'} waiting to be saved to the sheet` : ''}${sh.lastOk === false || sh.pushOk === false ? ' (with problems — see Settings)' : ''}.</span></span>
     <span class="row">${url ? html`<a class="btn small" href="${url}" target="_blank" rel="noopener">Open sheet</a>` : ''}
       ${isOwner() ? html`<button class="btn small" data-sync>Sync now</button>` : ''}</span>
   </div>`;
@@ -707,6 +713,7 @@ async function pageClock(main) {
 const invState = { status: 'active', channel: '', q: '' };
 
 async function pageInventory(main) {
+  if (sheetLinked('inventory')) await refreshStatus().catch(() => {});
   const hashStatus = new URLSearchParams(location.hash.split('?')[1] || '').get('status');
   if (hashStatus) { invState.status = hashStatus; history.replaceState(null, '', '#/inventory'); }
   const params = new URLSearchParams({ status: invState.status, channel: invState.channel, q: invState.q });
@@ -719,11 +726,11 @@ async function pageInventory(main) {
       <div class="row">
         ${owner ? html`<a class="btn" href="/api/export/books.csv">Export CSV</a>` : ''}
         <a class="btn" href="#/lister">📷 List a book</a>
-        ${sheetLinked('inventory') ? '' : html`<button class="btn primary" id="add-book">+ Add book</button>`}
+        ${sheetReadOnly('inventory') ? '' : html`<button class="btn primary" id="add-book">+ Add book</button>`}
       </div>
     </div>
     ${sheetBanner('inventory')}
-    ${counts.stale ? html`<div class="alert"><span>⚠</span><span><strong>${counts.stale} sold-out ${counts.stale === 1 ? 'book is' : 'books are'} still marked as listed</strong> on eBay, Whatnot or Amazon. End those listings, then ${sheetLinked('inventory') ? 'update the sheet' : 'uncheck them here'}, so nothing sells twice.</span></div>` : ''}
+    ${counts.stale ? html`<div class="alert"><span>⚠</span><span><strong>${counts.stale} sold-out ${counts.stale === 1 ? 'book is' : 'books are'} still marked as listed</strong> on eBay, Whatnot or Amazon. End those listings, then ${sheetReadOnly('inventory') ? 'update the sheet' : 'uncheck them here'}, so nothing sells twice.</span></div>` : ''}
     <div class="toolbar">
       <input type="search" id="inv-q" placeholder="Search title, author, SKU, ISBN, shelf…" value="${invState.q}" aria-label="Search inventory">
       <div class="seg" role="group" aria-label="Stock status">${statusTabs.map(([k, l]) => html`<button type="button" data-status="${k}" aria-pressed="${invState.status === k}">${l}${k !== 'all' ? html`<span class="count">${counts[k] || 0}</span>` : ''}</button>`)}</div>
@@ -746,7 +753,7 @@ async function pageInventory(main) {
           ${owner ? html`<td class="num">${money(b.cost_cents)}</td>` : ''}
           <td class="num">${money(b.list_price_cents)}</td>
           <td><div class="chips">${LISTING_CHANNELS.filter((k) => b[`${k}_listed`]).map((k) => channelChip(k))}${b.archived ? html`<span class="pill">archived</span>` : ''}</div></td>
-          <td class="num">${b.quantity > 0 && !b.archived && !sheetLinked('sales') ? html`<button class="btn small" data-sell="${b.id}">Sell</button>` : ''}</td>
+          <td class="num">${b.quantity > 0 && !b.archived && !sheetReadOnly('sales') ? html`<button class="btn small" data-sell="${b.id}">Sell</button>` : ''}</td>
         </tr>`) : html`<tr><td colspan="10" class="empty">${invState.q ? 'No books match your search.' : 'Nothing here yet.'}</td></tr>`}
         </tbody></table></div>
     </div>`.s;
@@ -781,7 +788,7 @@ async function bookModal(book, onDone) {
   const isNew = !book;
   const b = book || { sku: (await api('/books/next-sku')).sku, quantity: 1, acquired_date: today() };
   const owner = isOwner();
-  const readOnly = b.origin === 'sheet';
+  const readOnly = b.origin === 'sheet' && !state.sheets?.writeBack;
   openModal({
     title: readOnly ? `${b.sku} — from Google Sheets` : isNew ? 'Add book' : `Edit ${b.sku}`,
     submitLabel: readOnly ? null : 'Save',
@@ -824,7 +831,7 @@ async function bookModal(book, onDone) {
       <datalist id="bindings">${['Hardcover', 'Hardcover w/ DJ', 'Paperback', 'Mass Market', 'Leather', 'Signed'].map((c) => html`<option value="${c}">`)}</datalist>`,
     extra: html`${!isNew && owner && !readOnly ? html`<button type="button" class="btn danger" id="del-book">Delete</button>` : ''}
       ${readOnly ? html`<span class="muted small">Row ${b.sheet_row} of your sheet — edit it there.</span>` : ''}
-      ${!isNew && b.quantity > 0 && !b.archived && !sheetLinked('sales') ? html`<button type="button" class="btn" id="sell-book">Record sale</button>` : ''}`,
+      ${!isNew && b.quantity > 0 && !b.archived && !sheetReadOnly('sales') ? html`<button type="button" class="btn" id="sell-book">Record sale</button>` : ''}`,
     onSubmit: async (v) => {
       const body = { ...v, cost_cents: toCents(v.cost), list_price_cents: toCents(v.list_price) };
       for (const k of LISTING_CHANNELS) body[`${k}_listed`] = !!v[`${k}_listed`];
@@ -909,7 +916,7 @@ async function saleModal({ book = null, sale = null, onDone }) {
       toast('Sale recorded');
       onDone?.();
       if (r.stillListed?.length) {
-        if (sheetLinked('inventory')) toast(`Last copy sold — end the ${r.stillListed.map((c) => CHANNELS[c].label).join(', ')} listing and set its quantity to 0 in your sheet.`);
+        if (sheetReadOnly('inventory')) toast(`Last copy sold — end the ${r.stillListed.map((c) => CHANNELS[c].label).join(', ')} listing and set its quantity to 0 in your sheet.`);
         else delistPrompt(r.sale.book_id, r.stillListed, onDone);
       }
     },
@@ -995,6 +1002,7 @@ async function delistPrompt(bookId, channels, onDone) {
 const salesState = { channel: '' };
 
 async function pageSales(main) {
+  if (sheetLinked('sales')) await refreshStatus().catch(() => {});
   const r = currentRange();
   const q = new URLSearchParams({ ...r, channel: salesState.channel });
   const { sales } = await api(`/sales?${q}`);
@@ -1004,7 +1012,7 @@ async function pageSales(main) {
   main.innerHTML = html`
     <div class="page-head">
       <div><h1>Sales</h1><div class="sub">${rangeLabel(r)}</div></div>
-      <div class="row"><a class="btn" href="/api/export/sales.csv?from=${r.from}&to=${r.to}">Export CSV</a>${sheetLinked('sales') ? '' : html`<button class="btn primary" id="add-sale">+ Record sale</button>`}</div>
+      <div class="row"><a class="btn" href="/api/export/sales.csv?from=${r.from}&to=${r.to}">Export CSV</a>${sheetReadOnly('sales') ? '' : html`<button class="btn primary" id="add-sale">+ Record sale</button>`}</div>
     </div>
     ${sheetBanner('sales')}
     <div class="toolbar">${rangeControls()}
@@ -1033,7 +1041,7 @@ async function pageSales(main) {
   const byId = new Map(sales.map((s) => [String(s.id), s]));
   $$('tr[data-id]', main).forEach((tr) => tr.addEventListener('click', () => {
     const sale = byId.get(tr.dataset.id);
-    if (sale.origin === 'sheet') fromSheetToast(sale);
+    if (sale.origin === 'sheet' && !state.sheets?.writeBack) fromSheetToast(sale);
     else saleModal({ sale, onDone: reload });
   }));
 }
@@ -1041,6 +1049,7 @@ async function pageSales(main) {
 // ---- expenses ---------------------------------------------------------------------------
 
 async function pageExpenses(main) {
+  if (sheetLinked('expenses')) await refreshStatus().catch(() => {});
   const r = currentRange();
   const [{ expenses }, { categories }] = await Promise.all([api(`/expenses?from=${r.from}&to=${r.to}`), api('/expense-categories')]);
   const total = expenses.reduce((t, e) => t + e.amount_cents, 0);
@@ -1049,7 +1058,7 @@ async function pageExpenses(main) {
   main.innerHTML = html`
     <div class="page-head">
       <div><h1>Expenses</h1><div class="sub">${rangeLabel(r)} · ${money(total)} total</div></div>
-      <div class="row"><a class="btn" href="/api/export/expenses.csv?from=${r.from}&to=${r.to}">Export CSV</a>${sheetLinked('expenses') ? '' : html`<button class="btn primary" id="add-exp">+ Add expense</button>`}</div>
+      <div class="row"><a class="btn" href="/api/export/expenses.csv?from=${r.from}&to=${r.to}">Export CSV</a>${sheetReadOnly('expenses') ? '' : html`<button class="btn primary" id="add-exp">+ Add expense</button>`}</div>
     </div>
     ${sheetBanner('expenses')}
     <div class="toolbar">${rangeControls()}</div>
@@ -1099,7 +1108,7 @@ async function pageExpenses(main) {
   const byId = new Map(expenses.map((e) => [String(e.id), e]));
   $$('tr[data-id]', main).forEach((tr) => tr.addEventListener('click', () => {
     const e = byId.get(tr.dataset.id);
-    if (e.origin === 'sheet') fromSheetToast(e);
+    if (e.origin === 'sheet' && !state.sheets?.writeBack) fromSheetToast(e);
     else modal(e);
   }));
 }
@@ -1292,23 +1301,48 @@ async function pageSettings(main) {
 function sheetsCard(sh) {
   const last = sh.last;
   const linkedAny = Object.values(sh.urls).some(Boolean);
+  const sa = sh.serviceAccountEmail;
+  const pushErr = sh.lastPush && !sh.lastPush.ok ? Object.entries(sh.lastPush.sections).filter(([, v]) => !v.ok) : [];
   return html`
     <form class="card stack" id="sheets-form" style="max-width:860px;margin-bottom:16px">
       <div class="card-head" style="margin:0"><h2>Google Sheets</h2>
-        <span class="hint">${linkedAny ? `Last synced ${timeAgo(last?.at)}` : 'Not connected'}</span></div>
-      <p class="muted small" style="margin:0">Paste the link to each tab that holds your data. Open the tab in Google Sheets and copy the address bar, so the link ends in <code>#gid=…</code>.
-        Linked sections are read from the sheet and can't be edited in the app. Leave a link blank to keep managing that section here.
-        The first row of each tab must be column headings (for example <em>Title, Author, SKU, Qty, Cost, Price</em> · <em>Date, Platform, Title, Sale Price, Fees, Postage</em> · <em>Date, Category, Vendor, Amount</em>).</p>
-      ${sh.serviceAccountEmail
-        ? html`<div class="sheet-banner"><span class="sheet-icon" aria-hidden="true">🔒</span><span>Private access is set up. Share your sheet (Viewer) with <strong>${sh.serviceAccountEmail}</strong>.</span></div>`
+        <span class="hint">${linkedAny ? `${sh.writeBack ? 'Two-way sync' : 'Read-only'} · last synced ${timeAgo(last?.at)}` : 'Not connected'}</span></div>
+
+      <details class="setup-guide" ${linkedAny ? '' : 'open'}>
+        <summary><strong>How to set it up</strong></summary>
+        <ol>
+          <li><strong>Make the spreadsheet.</strong> Use your existing Google Sheet, or create a new one with three tabs named <em>Inventory</em>, <em>Sales</em> and <em>Expenses</em>.
+            Put column headings in the first row (e.g. <em>SKU, Title, Author, Qty, Cost, Price, eBay</em> · <em>Date, Platform, SKU, Title, Sale Price, Fees, Postage</em> · <em>Date, Category, Vendor, Amount</em>).
+            With two-way sync on, you can leave a new tab completely blank and the app adds the headings itself.</li>
+          <li><strong>Give the app access.</strong> ${sa
+            ? html`Click <em>Share</em> in Google Sheets and add <strong class="copyable">${sa}</strong> as an <strong>Editor</strong> (Viewer is enough for read-only).`
+            : html`For the app to <em>write</em> to the sheet, the server needs a Google service account — a free “robot” Google login. The README’s <em>Google Sheets</em> section walks through creating one in about 10 minutes; once it’s set, this step shows the email to share the sheet with.
+              Until then, the app can only read a sheet shared as <em>Anyone with the link can view</em>.`}</li>
+          <li><strong>Paste each tab’s link below.</strong> Open the tab, copy the address bar (it ends in <code>#gid=…</code>), and paste it into the matching box. Leave a box empty to keep that section in the app only.</li>
+          <li><strong>Turn on two-way sync</strong> so books, sales and expenses added or changed in the app are written to the sheet too, then click <em>Save &amp; sync</em>.</li>
+        </ol>
+      </details>
+
+      ${sa
+        ? html`<div class="sheet-banner"><span class="sheet-icon" aria-hidden="true">🔒</span><span>Private access is set up. Share your sheet with <strong>${sa}</strong> — as <strong>Editor</strong> for two-way sync.</span></div>`
         : sh.serviceAccountError
           ? html`<div class="alert"><span>⚠</span><span>${sh.serviceAccountError}</span></div>`
-          : html`<div class="sheet-banner"><span class="sheet-icon" aria-hidden="true">🔗</span><span>The sheet must be shared as <strong>“Anyone with the link can view”</strong>. To keep it private instead, set up a Google service account (see the README).</span></div>`}
+          : html`<div class="sheet-banner"><span class="sheet-icon" aria-hidden="true">🔗</span><span>No service account yet, so the app can only <strong>read</strong> a sheet shared as “Anyone with the link can view”. Set one up (README) to let the app write back.</span></div>`}
+
+      <label class="switch-row ${sa ? '' : 'disabled'}">
+        <input type="checkbox" name="writeBack" ${sh.writeBack ? 'checked' : ''} ${sa ? '' : 'disabled'}>
+        <span><strong>Two-way sync</strong> — save changes made in the app (new books, edits, sales, eBay listings, stock counts, expenses) back to the sheet.
+          <span class="muted small">Only the matching cells are updated; your other columns, formatting and formulas are left alone.</span></span>
+      </label>
+      ${pushErr.length ? html`<div class="alert"><span>⚠</span><span><strong>Couldn’t save some changes to the sheet:</strong> ${pushErr.map(([k, v]) => `${SECTION_LABEL[k]}: ${v.error}`).join(' · ')}. They’ll be retried on the next sync.</span></div>` : ''}
+
       ${SECTIONS_LIST.map((k) => html`<label class="field">${SECTION_LABEL[k]} tab link
         <input name="${k}" value="${sh.urls[k]}" placeholder="https://docs.google.com/spreadsheets/d/…/edit#gid=…" inputmode="url"></label>
         ${last?.sections?.[k] ? syncResult(last.sections[k]) : ''}
-        ${sh.appRows?.[k] ? html`<div class="alert" style="margin:0"><span>ⓘ</span><span>${sh.appRows[k]} ${k === 'inventory' ? 'books were' : `${k} were`} entered in the app before linking and still count alongside the sheet.
-          If your sheet already has them, <button type="button" class="btn link small" data-clear="${k}">remove the app-entered ${k === 'inventory' ? 'books' : k}</button>.</span></div>` : ''}`)}
+        ${sh.pending?.[k] ? html`<div class="small muted">⏳ ${plural(sh.pending[k], 'change')} waiting to be saved to the sheet.</div>` : ''}
+        ${sh.appRows?.[k] ? html`<div class="alert" style="margin:0"><span>ⓘ</span><span>${sh.appRows[k]} ${k === 'inventory' ? 'books were' : `${k} were`} entered in the app before linking and aren’t in the sheet.
+          ${sh.writeBack ? html`<button type="button" class="btn small" data-export="${k}">Copy them into the sheet</button> or ` : 'If your sheet already has them, '}
+          <button type="button" class="btn link small" data-clear="${k}">remove them from the app</button>.</span></div>` : ''}`)}
       <label class="field" style="max-width:260px">Sync automatically every
         <select name="autoMinutes">${[[0, 'Off (manual only)'], [5, '5 minutes'], [15, '15 minutes'], [30, '30 minutes'], [60, 'hour'], [240, '4 hours']].map(([v, l]) => html`<option value="${v}" ${sh.autoMinutes === v ? 'selected' : ''}>${l}</option>`)}</select></label>
       <div class="error" role="alert"></div>
@@ -1332,6 +1366,19 @@ function syncResult(r) {
 
 function bindSheetsCard(main, reload) {
   bindSheetBanner(main, reload);
+  $$('[data-export]', main).forEach((b) => b.addEventListener('click', async () => {
+    const k = b.dataset.export;
+    b.disabled = true;
+    b.innerHTML = '<span class="spinner"></span> Copying…';
+    try {
+      const r = await api('/sheets/export', { method: 'POST', body: { section: k } });
+      const sec = r.result?.sections?.[k];
+      if (sec && !sec.ok) toast(sec.error, true);
+      else toast(`Copied ${r.queued} into the sheet`);
+      await refreshStatus();
+    } catch (err) { toast(err.message, true); }
+    reload();
+  }));
   $$('[data-clear]', main).forEach((b) => b.addEventListener('click', async () => {
     const k = b.dataset.clear;
     if (!(await confirmModal(`Remove app-entered ${k === 'inventory' ? 'books' : k}?`, `This permanently deletes the ${k === 'inventory' ? 'books' : k} that were typed into the app. Everything from your Google Sheet stays.`, 'Remove'))) return;
@@ -1344,7 +1391,7 @@ function bindSheetsCard(main, reload) {
     e.preventDefault();
     const v = Object.fromEntries(new FormData(form));
     try {
-      await api('/sheets', { method: 'PUT', body: { urls: { inventory: v.inventory, sales: v.sales, expenses: v.expenses }, autoMinutes: Number(v.autoMinutes) } });
+      await api('/sheets', { method: 'PUT', body: { urls: { inventory: v.inventory, sales: v.sales, expenses: v.expenses }, autoMinutes: Number(v.autoMinutes), writeBack: !!v.writeBack } });
       await refreshStatus();
       if (SECTIONS_LIST.some((k) => v[k])) await runSync(reload, $('button[type=submit]', form));
       else { toast('Google Sheets disconnected'); reload(); }
@@ -1473,7 +1520,7 @@ async function pageLister(main) {
 function renderLister(main, eb) {
   const f = lister.form;
   const ai = lister.ai;
-  const sheetBook = lister.book?.origin === 'sheet';
+  const sheetBook = lister.book?.origin === 'sheet' && !state.sheets?.writeBack;
   const allPhotos = [
     ...lister.existing.map((p) => ({ kind: 'saved', id: p.id, src: photoUrl(p.id) })),
     ...lister.photos.map((p, i) => ({ kind: 'new', i, src: p.thumb })),
@@ -1678,7 +1725,7 @@ function renderLister(main, eb) {
         } : null,
       };
       const r = await api('/lister/save', { method: 'POST', body });
-      if (sheetLinked('inventory') && r.book.origin !== 'sheet') {
+      if (sheetReadOnly('inventory') && r.book.origin !== 'sheet') {
         const b = r.book;
         r.sheetNote = [b.sku, b.title, b.author, b.quantity, centsInput(b.cost_cents), centsInput(b.list_price_cents), b.location, b.ebay_ref].join('\t');
       }
