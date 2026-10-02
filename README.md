@@ -1,6 +1,8 @@
 # Alicea Rare Books — Shop Manager
 
-A small web app for a home book business that sells on **eBay, Whatnot and Amazon**. It handles:
+A small web app for a home book business that sells on **eBay, Whatnot and Amazon**. Everyone signs in to a home screen of app cards, one per tool:
+
+- **eBay Listing Tool**: photograph a book with a phone or upload pictures. AI (Claude) reads the cover and fills in the title, author, edition, condition, an eBay title, a description and a suggested price. Check the details, then list it on eBay in one tap. The photos double as inventory thumbnails.
 
 - **Inventory**: every book with its SKU, condition, shelf location, cost, asking price, and which platforms it's listed on (with listing IDs).
 - **Sales**: record a sale from any channel. Stock drops automatically, and the platform fees, postage and cost of the book are tracked so you see real profit. If the last copy sells while it's still listed on another site, the app reminds you to end those listings so the book can't sell twice.
@@ -9,7 +11,9 @@ A small web app for a home book business that sells on **eBay, Whatnot and Amazo
 - **Hours & pay**: weekly hours per employee by day, regular and overtime hours, rate and gross pay. You can export it to CSV or print it, and you can fix or add shifts.
 - **Owner dashboard**: net profit, gross sales, expenses, labor and fees for any date range. It also shows weekly sales by channel, a profit & loss breakdown, each employee's hours/rate/pay this week (and who's on the clock right now), inventory value, and a list of books that need delisting.
 
-Owners see everything. Employees see only the **Time Clock** and **Inventory** pages; from Inventory they can add or edit books and record sales.
+Owners see everything. Employees see the **eBay Listing Tool**, **Timeclock** and **Inventory**; from Inventory they can add or edit books and record sales.
+
+The top bar has a **Light/Dark** switch, **Lock** (hides the screen on a shared computer until the password is entered; the time clock keeps running) and **Sign Out**. On a phone, use the browser's "Add to Home Screen" to install it like an app.
 
 **Google Sheets:** inventory, sales and expenses can be read from your own Google Sheet instead of being typed into the app. See [Reading from Google Sheets](#reading-from-google-sheets).
 
@@ -44,6 +48,9 @@ To start over, delete the `data/` folder.
 | `TRUST_PROXY` | unset | Set to `1` when running behind an HTTPS reverse proxy |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | unset | Path to a Google service account JSON key, for reading private sheets |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | unset | The same key's contents, instead of a file path |
+| `ANTHROPIC_API_KEY` | unset | Turns on AI book identification in the eBay Listing Tool |
+| `EBAY_CLIENT_ID` / `EBAY_CLIENT_SECRET` / `EBAY_RU_NAME` | unset | eBay developer keys for listing on eBay |
+| `EBAY_ENV` | production | Set to `sandbox` to test against eBay's sandbox |
 
 In the app, **Settings** controls the business name, which day the pay week starts on, overtime rules (default: over 40 hrs/week at 1.5×) and the expense categories.
 
@@ -53,7 +60,7 @@ Run it on a computer at home and have employees open `http://<that-computer's-IP
 
 ### Backups
 
-Everything lives in one file, `data/books.db`. Copy it somewhere safe regularly. The CSV exports (Inventory, Sales, Expenses, Hours & Pay) also work well for your accountant.
+Everything lives in the `data/` folder: the database `books.db` and book photos in `photos/`. Copy the whole folder somewhere safe regularly. The CSV exports (Inventory, Sales, Expenses, Hours & Pay) also work well for your accountant.
 
 ## Reading from Google Sheets
 
@@ -92,6 +99,46 @@ After that it re-reads the sheet automatically (every 15 minutes by default; you
 
 Keep the key file private, and don't commit it to git.
 
+## eBay Listing Tool
+
+### 1. Turn on the AI
+
+The AI step uses Claude (model `claude-opus-5-5`). Create an API key at [console.anthropic.com](https://console.anthropic.com/) and start the server with it:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... npm start
+```
+
+Each "Fill in details with AI" sends the photos (up to 6, resized to 1600px) and usually costs a few cents. The AI only claims edition, printing or signature details the photos support. It lists anything you should double-check under **Check before listing**, and the suggested price is an estimate; use the *Check sold listings on eBay* link to confirm it.
+
+### 2. Connect eBay
+
+Listings are created through eBay's official Sell APIs (Inventory, Account and Media).
+
+1. Sign up at [developer.ebay.com](https://developer.ebay.com/) and create an application keyset (start with **Sandbox** to test, then **Production**). Note the **App ID (Client ID)** and **Cert ID (Client Secret)**.
+2. Under **User Tokens → Get a Token from eBay via Your Application**, add an eBay redirect URL. Set **Your auth accepted URL** to `https://<your-app-address>/api/ebay/callback` and copy the generated **RuName**.
+   - eBay requires HTTPS here, so the app needs to be reachable over HTTPS at that address (for example through Tailscale Funnel, a Cloudflare Tunnel or Caddy). See *Using it from phones* above.
+3. In eBay Seller Hub, turn on **Business policies** (Account → Business policies) and create at least one shipping, payment and return policy.
+4. Start the server with the keys:
+   ```bash
+   EBAY_CLIENT_ID=... EBAY_CLIENT_SECRET=... EBAY_RU_NAME=... npm start   # add EBAY_ENV=sandbox while testing
+   ```
+5. As the owner, open **Settings → eBay → Connect eBay account**, sign in on eBay, and approve access. Back in the app, choose the shipping, payment and return policies and a ship-from location (you can add one there), then click **Save**.
+
+### 3. List a book
+
+1. Open **eBay Listing Tool**. Tap **Take photo** for the cover; add the spine, the copyright page and any flaws if you like.
+2. Tap **✨ Fill in details with AI**, then review every field.
+3. Tap **Save & list on eBay**. The book is added to inventory with its photos, the listing goes live, and you get a **View on eBay** link.
+   - **Save to inventory** keeps it as a draft for later. Any in-stock book can also be listed from its Inventory card with **List on eBay**.
+
+Listing details:
+- **Category:** *Books* (261186) or *Antiquarian & Collectible* (29223). The AI suggests Collectible for true firsts, signed copies and older scarce books.
+- **Condition:** shown with eBay's book conditions (Like New, Very Good, Good, Acceptable), mapped from booksellers' grades.
+- **Item specifics:** Book Title, Author, Language, Publisher, Year, Format, Edition and Signed are sent automatically.
+- **When the last copy sells elsewhere,** the app offers to end the eBay listing for you so it can't sell twice. **End eBay listing** on a book's card does the same.
+- **Inventory from a Google Sheet:** books created in the Listing Tool are still saved, and the app gives you a row to paste into your sheet. Once the sheet has a row with the same SKU, it merges into that book and keeps its photos.
+
 ## How the numbers work
 
 - **Profit on a sale** = item price + shipping charged − platform fees − postage you paid − what you paid for the book.
@@ -102,9 +149,9 @@ Keep the key file private, and don't commit it to git.
 
 ```bash
 npm run dev   # restarts on file changes
-npm test      # API and payroll tests
+npm test      # API, payroll, Sheets, AI and eBay tests (eBay and the AI are faked; no keys needed)
 ```
 
-- `server/`: Express API (`app.js`), database schema (`db.js`), auth (`auth.js`), time and pay math (`payroll.js`), Google Sheets import (`sheets.js`)
+- `server/`: Express API (`app.js`), database schema (`db.js`), auth (`auth.js`), time and pay math (`payroll.js`), Google Sheets import (`sheets.js`), AI book identification (`ai.js`), eBay integration (`ebay.js`)
 - `public/`: the browser app (plain HTML/CSS/JS, no build step)
 - `test/`: tests run with Node's built-in test runner

@@ -1,21 +1,29 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getSettings, tx, DEFAULT_SETTINGS } from './db.js';
+import { dataDir, getSettings, tx, DEFAULT_SETTINGS } from './db.js';
 import { COOKIE, createSession, hashPassword, sessionUser, verifyPassword } from './auth.js';
 import {
   addDays, computePay, entryHours, isValidDate, isValidTimestamp, nowLocal, todayLocal, weekStartOf,
 } from './payroll.js';
 import { SECTIONS, parseSheetUrl, serviceAccount, syncAll } from './sheets.js';
+import { AiError, hasAiCredentials, identifyBook, AI_MODEL } from './ai.js';
+import {
+  CATEGORIES, CONDITIONS, EbayClient, EbayError, bookAspects, conditionFromGrade, descriptionHtml, ebayConfig,
+} from './ebay.js';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 export const CHANNELS = ['ebay', 'whatnot', 'amazon', 'other'];
 const SECTION_TABLE = { inventory: 'books', sales: 'sales', expenses: 'expenses' };
 
 class ApiError extends Error {
-  constructor(status, message) {
+  /** expose: show the message to the user even for 5xx (e.g. an eBay or AI service problem). */
+  constructor(status, message, expose = false) {
     super(message);
     this.status = status;
+    this.expose = expose;
   }
 }
 const bad = (msg) => new ApiError(400, msg);
@@ -86,9 +94,14 @@ function sendCsv(res, filename, body) {
 
 // ---- app ------------------------------------------------------------------
 
-export function createApp(db, { fetchImpl, env = process.env } = {}) {
+export function createApp(db, {
+  fetchImpl, env = process.env, anthropic, photosDir = path.join(dataDir(env.DB_PATH), 'photos'),
+} = {}) {
   const app = express();
+  fs.mkdirSync(photosDir, { recursive: true });
   app.disable('x-powered-by');
+  // Photos travel as base64 JSON, so these routes accept bigger bodies.
+  app.use(['/api/ai', '/api/lister', '/api/books/:id/photos'], express.json({ limit: '40mb' }));
   app.use(express.json({ limit: '1mb' }));
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -281,7 +294,8 @@ export function createApp(db, { fetchImpl, env = process.env } = {}) {
       where.push(`(title LIKE ? OR author LIKE ? OR sku LIKE ? OR isbn LIKE ? OR location LIKE ? OR publisher LIKE ?)`);
       params.push(...Array(6).fill(`%${q}%`));
     }
-    const sql = `SELECT * FROM books ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY updated_at DESC, id DESC LIMIT 2000`;
+    const sql = `SELECT books.*, (SELECT id FROM photos p WHERE p.book_id = books.id ORDER BY position, id LIMIT 1) AS photo_id
+      FROM books ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY updated_at DESC, id DESC LIMIT 2000`;
     const counts = db.prepare(`SELECT
         SUM(archived = 0 AND quantity > 0) AS active,
         SUM(archived = 0 AND quantity = 0) AS soldout,
@@ -296,7 +310,7 @@ export function createApp(db, { fetchImpl, env = process.env } = {}) {
     const sales = req.user.role === 'owner'
       ? db.prepare('SELECT * FROM sales WHERE book_id = ? ORDER BY sale_date DESC').all(book.id)
       : [];
-    res.json({ book, sales });
+    res.json({ book, sales, photos: bookPhotos(book.id) });
   });
 
   app.post('/api/books', auth, (req, res) => {
@@ -326,8 +340,10 @@ export function createApp(db, { fetchImpl, env = process.env } = {}) {
       db.prepare(`UPDATE books SET archived = 1, updated_at = datetime('now') WHERE id = ?`).run(req.params.id);
       return res.json({ archived: true });
     }
+    const photoIds = bookPhotos(req.params.id).map((p) => p.id);
     const r = db.prepare('DELETE FROM books WHERE id = ?').run(req.params.id);
     if (!r.changes) throw new ApiError(404, 'Book not found');
+    photoIds.forEach(removePhotoFiles);
     res.json({ deleted: true });
   });
 
@@ -738,6 +754,314 @@ export function createApp(db, { fetchImpl, env = process.env } = {}) {
     res.json(await syncSheets());
   });
 
+  // ---- photos -------------------------------------------------------------
+
+  const MAX_PHOTOS = 24; // eBay's per-listing limit
+  const bookPhotos = (bookId) => db.prepare('SELECT id, position, ebay_url FROM photos WHERE book_id = ? ORDER BY position, id').all(bookId);
+  const photoPath = (id, thumb) => path.join(photosDir, `${Number(id)}${thumb ? '_t' : ''}.jpg`);
+  function removePhotoFiles(id) {
+    for (const t of [false, true]) fs.rmSync(photoPath(id, t), { force: true });
+  }
+
+  function decodeJpeg(dataUrl, what) {
+    const m = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl || '');
+    if (!m) throw bad(`${what} must be a JPEG image`);
+    const buf = Buffer.from(m[1], 'base64');
+    if (buf.length > 8 * 1024 * 1024) throw bad(`${what} is too large (8 MB max)`);
+    if (buf[0] !== 0xff || buf[1] !== 0xd8) throw bad(`${what} isn't a valid JPEG`);
+    return buf;
+  }
+
+  /** images: [{ data, thumb }] JPEG data URLs (resized in the browser). */
+  function savePhotos(bookId, images = []) {
+    if (!Array.isArray(images)) throw bad('images must be a list');
+    const have = bookPhotos(bookId);
+    if (have.length + images.length > MAX_PHOTOS) throw bad(`A book can have at most ${MAX_PHOTOS} photos`);
+    const decoded = images.map((img, i) => ({ full: decodeJpeg(img?.data, `Photo ${i + 1}`), thumb: decodeJpeg(img?.thumb || img?.data, `Photo ${i + 1} thumbnail`) }));
+    let pos = have.length ? Math.max(...have.map((p) => p.position)) + 1 : 0;
+    for (const d of decoded) {
+      const id = Number(db.prepare('INSERT INTO photos (book_id, position) VALUES (?, ?)').run(bookId, pos++).lastInsertRowid);
+      fs.writeFileSync(photoPath(id), d.full);
+      fs.writeFileSync(photoPath(id, true), d.thumb);
+    }
+    return bookPhotos(bookId);
+  }
+
+  const getBook = (id) => {
+    const book = db.prepare('SELECT * FROM books WHERE id = ?').get(id);
+    if (!book) throw new ApiError(404, 'Book not found');
+    return book;
+  };
+
+  app.post('/api/books/:id/photos', auth, (req, res) => {
+    getBook(req.params.id);
+    res.status(201).json({ photos: savePhotos(Number(req.params.id), req.body.images) });
+  });
+
+  app.get('/api/photos/:id', auth, (req, res) => {
+    const file = photoPath(req.params.id, req.query.size === 'thumb');
+    if (!/^\d+$/.test(req.params.id) || !fs.existsSync(file)) throw new ApiError(404, 'Photo not found');
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    res.type('jpeg').sendFile(file);
+  });
+
+  app.post('/api/photos/:id/cover', auth, (req, res) => {
+    const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id);
+    if (!photo) throw new ApiError(404, 'Photo not found');
+    const min = db.prepare('SELECT MIN(position) AS m FROM photos WHERE book_id = ?').get(photo.book_id).m;
+    db.prepare('UPDATE photos SET position = ? WHERE id = ?').run(min - 1, photo.id);
+    res.json({ photos: bookPhotos(photo.book_id) });
+  });
+
+  app.delete('/api/photos/:id', auth, (req, res) => {
+    const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id);
+    if (!photo) throw new ApiError(404, 'Photo not found');
+    db.prepare('DELETE FROM photos WHERE id = ?').run(photo.id);
+    removePhotoFiles(photo.id);
+    res.json({ photos: bookPhotos(photo.book_id) });
+  });
+
+  // ---- AI identification --------------------------------------------------
+
+  app.post('/api/ai/identify', auth, async (req, res) => {
+    try {
+      res.json({ book: await identifyBook(req.body.images, { client: anthropic }) });
+    } catch (err) {
+      if (err instanceof AiError) throw new ApiError(err.status, err.message, true);
+      throw err;
+    }
+  });
+
+  // ---- eBay ---------------------------------------------------------------
+
+  const ebayCfg = ebayConfig(env);
+  const settingsStore = {
+    get: (k) => getSettings(db)[k] || '',
+    set: (obj) => {
+      const upd = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+      tx(db, () => Object.entries(obj).forEach(([k, v]) => upd.run(k, String(v ?? ''))));
+    },
+  };
+  const ebay = new EbayClient(ebayCfg, settingsStore, fetchImpl || fetch);
+  const ebayPolicy = () => {
+    const st = getSettings(db);
+    return {
+      fulfillmentPolicyId: st.ebay_fulfillment_policy_id,
+      paymentPolicyId: st.ebay_payment_policy_id,
+      returnPolicyId: st.ebay_return_policy_id,
+      merchantLocationKey: st.ebay_location_key,
+    };
+  };
+  const ebayReady = () => ebay.connected && Object.values(ebayPolicy()).every(Boolean);
+  const wrapEbay = (fn) => async (req, res) => {
+    try {
+      await fn(req, res);
+    } catch (err) {
+      if (err instanceof EbayError) throw new ApiError(err.status, err.message, true);
+      throw err;
+    }
+  };
+
+  app.get('/api/ebay', auth, (req, res) => {
+    const st = getSettings(db);
+    res.json({
+      configured: ebayCfg.configured,
+      sandbox: ebayCfg.sandbox,
+      connected: ebay.connected,
+      user: st.ebay_user,
+      ready: ebayReady(),
+      ai: hasAiCredentials(env) || !!anthropic,
+      aiModel: AI_MODEL,
+      categories: CATEGORIES,
+      conditions: CONDITIONS,
+      ...(req.user.role === 'owner' && { policy: ebayPolicy(), refreshExpires: st.ebay_refresh_expires }),
+    });
+  });
+
+  app.post('/api/ebay/connect', auth, ownerOnly, (req, res) => {
+    if (!ebayCfg.configured) throw bad('Set EBAY_CLIENT_ID, EBAY_CLIENT_SECRET and EBAY_RU_NAME on the server first (see README).');
+    const state = crypto.randomBytes(16).toString('hex');
+    settingsStore.set({ ebay_oauth_state: `${state}.${Date.now() + 15 * 60000}` });
+    res.json({ url: ebay.authorizeUrl(state) });
+  });
+
+  // eBay sends the browser back here after the owner approves access.
+  app.get('/api/ebay/callback', async (req, res) => {
+    const user = sessionUser(db, req);
+    const back = (msg) => res.redirect(`/#/settings?ebay=${encodeURIComponent(msg)}`);
+    if (!user || user.role !== 'owner') return back('Sign in as the owner, then connect eBay again.');
+    const [state, exp] = (getSettings(db).ebay_oauth_state || '').split('.');
+    settingsStore.set({ ebay_oauth_state: '' });
+    if (!state || req.query.state !== state || Number(exp) < Date.now()) return back('That eBay sign-in link expired. Try connecting again.');
+    if (!req.query.code) return back('eBay access was not granted.');
+    try {
+      await ebay.connect(String(req.query.code));
+      return back('connected');
+    } catch (err) {
+      return back(err.message);
+    }
+  });
+
+  app.post('/api/ebay/disconnect', auth, ownerOnly, (req, res) => {
+    ebay.disconnect();
+    res.json({ ok: true });
+  });
+
+  app.get('/api/ebay/policies', auth, ownerOnly, wrapEbay(async (req, res) => {
+    res.json({ ...(await ebay.policies()), selected: ebayPolicy() });
+  }));
+
+  app.put('/api/ebay/settings', auth, ownerOnly, (req, res) => {
+    const map = { fulfillmentPolicyId: 'ebay_fulfillment_policy_id', paymentPolicyId: 'ebay_payment_policy_id', returnPolicyId: 'ebay_return_policy_id', merchantLocationKey: 'ebay_location_key' };
+    const out = {};
+    for (const [k, key] of Object.entries(map)) if (k in req.body) out[key] = str(req.body, k, { max: 100 });
+    settingsStore.set(out);
+    res.json({ policy: ebayPolicy(), ready: ebayReady() });
+  });
+
+  app.post('/api/ebay/locations', auth, ownerOnly, wrapEbay(async (req, res) => {
+    const loc = {
+      name: str(req.body, 'name', { max: 100 }), city: str(req.body, 'city', { max: 100 }),
+      state: str(req.body, 'state', { max: 50 }), postalCode: str(req.body, 'postalCode', { required: true, max: 20 }),
+      country: str(req.body, 'country', { max: 2 }) || 'US',
+    };
+    const key = await ebay.createLocation(loc);
+    settingsStore.set({ ebay_location_key: key });
+    res.status(201).json({ key });
+  }));
+
+  function readListing(body, book) {
+    const l = body || {};
+    const condition = l.condition && CONDITIONS[l.condition] ? l.condition : conditionFromGrade(book.condition);
+    const categoryId = CATEGORIES[l.category_id] ? String(l.category_id) : '261186';
+    const priceCents = int(l, 'price_cents', { min: 1, max: 10000000, fallback: book.list_price_cents });
+    if (!(priceCents > 0)) throw bad('Set a price before listing on eBay');
+    const quantity = int(l, 'quantity', { min: 1, max: 10000, fallback: Math.max(1, book.quantity) });
+    const title = str(l, 'title', { max: 80 }) || book.title.slice(0, 80);
+    const description = str(l, 'description', { max: 20000 }) || book.description || book.title;
+    return { condition, categoryId, priceCents, quantity, title, description, conditionNotes: str(l, 'condition_notes', { max: 1000 }), aspects: l.aspects || {} };
+  }
+
+  /** Uploads the book's photos to eBay (once each) and publishes the listing. */
+  async function listOnEbay(book, l) {
+    if (book.sku.length > 50 || !/^[A-Za-z0-9._-]+$/.test(book.sku)) throw bad('eBay SKUs can only use letters, numbers, dots, dashes and underscores (max 50). Change this book\'s SKU first.');
+    if (book.quantity < 1) throw bad('This book is out of stock');
+    const photos = bookPhotos(book.id);
+    if (!photos.length) throw bad('Add at least one photo before listing on eBay');
+    const imageUrls = [];
+    for (const p of photos) {
+      if (!p.ebay_url) {
+        p.ebay_url = await ebay.uploadImage(fs.readFileSync(photoPath(p.id)), `${book.sku}-${p.id}.jpg`);
+        db.prepare('UPDATE photos SET ebay_url = ? WHERE id = ?').run(p.ebay_url, p.id);
+      }
+      imageUrls.push(p.ebay_url);
+    }
+    const isbn = book.isbn.replace(/[^0-9Xx]/g, '');
+    const details = {
+      Author: book.author, Publisher: book.publisher, Year: book.pub_year, Edition: book.edition,
+      Binding: book.binding, Condition: book.condition, ISBN: isbn,
+    };
+    const result = await ebay.publish({
+      sku: book.sku,
+      title: l.title,
+      descriptionText: l.description.slice(0, 4000),
+      descriptionHtml: descriptionHtml([l.description, l.conditionNotes && `Condition notes: ${l.conditionNotes}`].filter(Boolean).join('\n\n'), details),
+      aspects: bookAspects(book, l.aspects),
+      imageUrls,
+      isbn: [10, 13].includes(isbn.length) ? isbn : '',
+      quantity: Math.min(l.quantity, book.quantity),
+      condition: l.condition,
+      conditionDescription: l.conditionNotes || (book.condition ? `Condition: ${book.condition}` : ''),
+      categoryId: l.categoryId,
+      priceCents: l.priceCents,
+    }, ebayPolicy());
+    db.prepare(`UPDATE books SET ebay_listed = 1, ebay_ref = ?, ebay_offer_id = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(result.listingId, result.offerId, book.id);
+    return result;
+  }
+
+  app.post('/api/books/:id/ebay/list', auth, wrapEbay(async (req, res) => {
+    const book = getBook(req.params.id);
+    res.json({ listing: await listOnEbay(book, readListing(req.body, book)), book: getBook(book.id) });
+  }));
+
+  app.post('/api/books/:id/ebay/end', auth, wrapEbay(async (req, res) => {
+    const book = getBook(req.params.id);
+    if (!book.ebay_offer_id) throw bad('This book wasn\'t listed from this app, so end the listing on eBay directly.');
+    await ebay.end(book.ebay_offer_id);
+    db.prepare(`UPDATE books SET ebay_listed = 0, updated_at = datetime('now') WHERE id = ?`).run(book.id);
+    res.json({ book: getBook(book.id) });
+  }));
+
+  // ---- eBay listing tool: save a book (+ photos) and optionally list it -----
+
+  app.post('/api/lister/save', auth, async (req, res) => {
+    const incoming = req.body.book || {};
+    let book;
+    if (req.body.book_id) {
+      book = getBook(req.body.book_id);
+      if (book.origin !== 'sheet') {
+        const b = readBook({ ...book, ...incoming, archived: book.archived });
+        const cols = Object.keys(b);
+        uniqueSku(() => db.prepare(`UPDATE books SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ?`)
+          .run(...cols.map((c) => b[c]), book.id));
+      }
+    } else {
+      // New books from the lister are allowed even when inventory comes from a sheet: adding a
+      // sheet row with the same SKU later merges into this record (keeping its photos).
+      const b = readBook({ quantity: 1, ...incoming, sku: incoming.sku || nextSku() });
+      const cols = Object.keys(b);
+      const id = uniqueSku(() => db.prepare(`INSERT INTO books (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`)
+        .run(...cols.map((c) => b[c])).lastInsertRowid);
+      book = getBook(id);
+    }
+    savePhotos(book.id, req.body.images || []);
+    book = getBook(book.id);
+    let listing = null;
+    let ebayError = null;
+    if (req.body.list) {
+      try {
+        listing = await listOnEbay(book, readListing(req.body.list, book));
+        book = getBook(book.id);
+      } catch (err) {
+        if (!(err instanceof EbayError || err instanceof ApiError)) throw err;
+        ebayError = err.message;
+      }
+    }
+    res.status(201).json({ book, photos: bookPhotos(book.id), listing, ebayError });
+  });
+
+  // ---- home screen --------------------------------------------------------
+
+  app.get('/api/home', auth, (req, res) => {
+    const settings = getSettings(db);
+    const today = todayLocal();
+    const open = db.prepare('SELECT clock_in FROM time_entries WHERE user_id = ? AND clock_out IS NULL LIMIT 1').get(req.user.id);
+    const weekFrom = weekStartOf(today, Number(settings.week_start));
+    const mine = db.prepare(`SELECT * FROM time_entries WHERE user_id = ? AND substr(clock_in, 1, 10) BETWEEN ? AND ?`).all(req.user.id, weekFrom, addDays(weekFrom, 6));
+    const inv = db.prepare(`SELECT COUNT(*) AS titles, COALESCE(SUM(ebay_listed), 0) AS on_ebay,
+      COALESCE(SUM(ebay_listed = 0 AND whatnot_listed = 0 AND amazon_listed = 0), 0) AS unlisted
+      FROM books WHERE archived = 0 AND quantity > 0`).get();
+    const out = {
+      clock: { since: open?.clock_in || null, week_hours: computePay(mine, settings)[req.user.id]?.total_hours || 0 },
+      inventory: inv,
+      ebay: { connected: ebay.connected, ready: ebayReady() },
+    };
+    if (req.user.role === 'owner') {
+      const monthFrom = `${today.slice(0, 7)}-01`;
+      out.sales = db.prepare(`SELECT COUNT(*) AS orders, COALESCE(SUM(sale_price_cents + shipping_charged_cents), 0) AS gross_cents
+        FROM sales WHERE sale_date BETWEEN ? AND ?`).get(monthFrom, today);
+      out.expenses = db.prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS cents FROM expenses WHERE expense_date BETWEEN ? AND ?`).get(monthFrom, today);
+      const week = payrollForWeek(today);
+      out.team = {
+        on_clock: db.prepare('SELECT COUNT(DISTINCT user_id) AS n FROM time_entries WHERE clock_out IS NULL').get().n,
+        week_pay_cents: week.totals.gross_cents, week_hours: week.totals.total_hours,
+        members: db.prepare(`SELECT COUNT(*) AS n FROM users WHERE active = 1`).get().n,
+      };
+    }
+    res.json(out);
+  });
+
   // ---- dashboard ----------------------------------------------------------
 
   app.get('/api/dashboard', auth, ownerOnly, (req, res) => {
@@ -889,8 +1213,8 @@ export function createApp(db, { fetchImpl, env = process.env } = {}) {
   app.use((err, req, res, next) => {
     if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON' });
     const status = err.status || 500;
-    if (status >= 500) console.error(err);
-    res.status(status).json({ error: status >= 500 ? 'Something went wrong on the server' : err.message });
+    if (status >= 500 && !err.expose) console.error(err);
+    res.status(status).json({ error: status >= 500 && !err.expose ? 'Something went wrong on the server' : err.message });
   });
 
   return app;

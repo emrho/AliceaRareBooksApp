@@ -96,6 +96,16 @@ CREATE TABLE IF NOT EXISTS time_entries (
 );
 CREATE INDEX IF NOT EXISTS time_user_idx ON time_entries(user_id, clock_in);
 
+-- Book photos (cover first). Files live in data/photos/<id>.jpg and <id>_t.jpg (thumbnail).
+CREATE TABLE IF NOT EXISTS photos (
+  id INTEGER PRIMARY KEY,
+  book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL DEFAULT 0,
+  ebay_url TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS photos_book_idx ON photos(book_id, position);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -115,15 +125,26 @@ export const DEFAULT_SETTINGS = {
   sheets_expenses_url: '',
   sheets_auto_minutes: '15',
   sheets_last_result: '',
+  // eBay account connection and listing defaults (see server/ebay.js).
+  ebay_refresh_token: '',
+  ebay_refresh_expires: '',
+  ebay_user: '',
+  ebay_oauth_state: '',
+  ebay_fulfillment_policy_id: '',
+  ebay_payment_policy_id: '',
+  ebay_return_policy_id: '',
+  ebay_location_key: '',
 };
 
 // Columns added after the first release; ALTER TABLE them onto older databases.
 const ADDED_COLUMNS = {
   // origin: 'app' (entered here) or 'sheet' (imported from Google Sheets)
-  books: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER' },
+  books: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER', ebay_offer_id: "TEXT NOT NULL DEFAULT ''" },
   sales: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER' },
   expenses: { origin: "TEXT NOT NULL DEFAULT 'app'", sheet_row: 'INTEGER' },
 };
+
+export const dataDir = (file = process.env.DB_PATH) => (file && file !== ':memory:' ? path.dirname(file) : path.join(process.cwd(), 'data'));
 
 export function openDb(file = process.env.DB_PATH || path.join(process.cwd(), 'data', 'books.db')) {
   if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });

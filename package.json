@@ -14,6 +14,7 @@
     "test": "node --disable-warning=ExperimentalWarning --test"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
     "express": "^5.2.1"
   }
 }

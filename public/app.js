@@ -91,13 +91,13 @@ function toast(msg, isError = false) {
  * Opens a form dialog. onSubmit(values, form) may throw to show an error and keep
  * the dialog open; resolve to close it.
  */
-function openModal({ title, body, submitLabel = 'Save', onSubmit, extra = '', onOpen, wide = false, readOnly = false }) {
+function openModal({ title, body, submitLabel = 'Save', onSubmit, extra = '', onOpen, wide = false, readOnly = false, prefix = '' }) {
   const dlg = $('#modal');
   dlg.style.width = wide ? 'min(900px, calc(100vw - 32px))' : '';
   dlg.innerHTML = html`
     <form class="modal" novalidate>
       <div class="modal-head"><h2>${title}</h2><button type="button" class="icon-btn" data-close aria-label="Close">✕</button></div>
-      <div class="modal-body">${readOnly ? html`<fieldset disabled class="plain">${body}</fieldset>` : body}<div class="error" role="alert"></div></div>
+      <div class="modal-body">${prefix}${readOnly ? html`<fieldset disabled class="plain">${body}</fieldset>` : body}<div class="error" role="alert"></div></div>
       <div class="modal-foot">${extra}<span class="spacer"></span>
         <button type="button" class="btn" data-close>${submitLabel ? 'Cancel' : 'Close'}</button>
         ${submitLabel ? html`<button type="submit" class="btn primary">${submitLabel}</button>` : ''}
@@ -143,6 +143,8 @@ let timers = [];
 const isOwner = () => state.user?.role === 'owner';
 
 const ICONS = {
+  home: '<path d="M3 11 12 3l9 8v10h-6v-6H9v6H3z"/>',
+  lister: '<path d="M4 7h3l2-3h6l2 3h3v13H4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.5" fill="none" stroke="currentColor" stroke-width="2"/>',
   dashboard: '<path d="M3 13h8V3H3zm10 8h8V11h-8zM3 21h8v-6H3zm10-18v6h8V3z"/>',
   clock: '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
   inventory: '<path d="M4 4h4v16H4zm6 0h4v16h-4zm6.2 1.3 3.8-1 4 15.5-3.9 1z" transform="scale(.9) translate(1 1)"/>',
@@ -155,9 +157,11 @@ const ICONS = {
 const icon = (name) => new Safe(`<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">${ICONS[name]}</svg>`);
 
 const ROUTES = {
-  dashboard: { label: 'Dashboard', owner: true, render: pageDashboard },
+  home: { label: 'Home', render: pageHome },
+  lister: { label: 'eBay Listing Tool', render: pageLister },
   clock: { label: 'Time Clock', render: pageClock },
   inventory: { label: 'Inventory', render: pageInventory },
+  dashboard: { label: 'Owner Dashboard', owner: true, render: pageDashboard },
   sales: { label: 'Sales', owner: true, render: pageSales },
   expenses: { label: 'Expenses', owner: true, render: pageExpenses },
   payroll: { label: 'Hours & Pay', owner: true, render: pagePayroll },
@@ -169,7 +173,7 @@ function currentRoute() {
   const name = location.hash.replace(/^#\/?/, '').split('?')[0];
   const r = ROUTES[name];
   if (r && (!r.owner || isOwner())) return name;
-  return isOwner() ? 'dashboard' : 'clock';
+  return 'home';
 }
 
 async function boot() {
@@ -179,6 +183,22 @@ async function boot() {
   renderApp();
 }
 
+// ---- theme -----------------------------------------------------------------------------------
+
+function storedTheme() {
+  try { return localStorage.getItem('theme'); } catch { return null; }
+}
+function currentTheme() {
+  return document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+}
+function setTheme(t) {
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('theme', t); } catch { /* per-device preference only */ }
+}
+if (storedTheme()) document.documentElement.dataset.theme = storedTheme();
+
+const firstName = (n) => String(n || '').split(' ')[0];
+
 function renderApp() {
   timers.forEach(clearInterval);
   timers = [];
@@ -187,47 +207,63 @@ function renderApp() {
     app.innerHTML = '';
     return state.needsSetup ? pageSetup(app) : pageLogin(app);
   }
+  const route = currentRoute();
   if (!$('.shell', app)) {
     app.innerHTML = html`
       <div class="shell">
-        <div class="topbar">
-          <button class="icon-btn" id="nav-toggle" aria-label="Open menu">☰</button>
-          <strong>${state.businessName}</strong>
-        </div>
-        <aside class="sidebar">
-          <div class="brand"><span class="brand-mark">AR</span><span>${state.businessName}</span></div>
-          <nav class="nav">
-            ${Object.entries(ROUTES).filter(([, r]) => !r.owner || isOwner()).map(([k, r]) => html`
-              <a href="#/${k}" data-route="${k}">${icon(r.icon || k)}${r.label}</a>`)}
-          </nav>
-          <div class="sidebar-foot">
-            <div class="who">${state.user.name}</div>
-            <div>${isOwner() ? 'Owner' : 'Team member'}</div>
-            <div class="row" style="margin-top:8px">
-              <button class="btn link small" id="pw-btn">Change password</button>
-              <button class="btn link small" id="logout-btn">Sign out</button>
-            </div>
+        <header class="appbar">
+          <a class="wordmark" href="#/home" aria-label="${state.businessName} — all apps">
+            <span class="brand-mark">AR</span><span class="wordmark-text">${state.businessName}</span></a>
+          <div class="appbar-center"><span id="appbar-title"></span> · ${firstName(state.user.name)}</div>
+          <div class="appbar-actions">
+            <details class="apps-menu">
+              <summary class="pill-btn" aria-label="Switch app"><span aria-hidden="true">▦</span><span class="pill-label">Apps</span></summary>
+              <nav class="apps-list">
+                ${TILES.filter((t) => !t.owner || isOwner()).map((t) => html`<a href="#/${t.route}" data-route="${t.route}"><span aria-hidden="true">${t.emoji}</span>${t.title}</a>`)}
+                <button type="button" id="pw-btn">🔑 Change password</button>
+              </nav>
+            </details>
+            <button class="pill-btn" id="theme-btn"><span class="theme-dot" aria-hidden="true"></span><span class="pill-label" id="theme-label"></span></button>
+            <button class="pill-btn" id="lock-btn" title="Lock this screen (your time clock keeps running)"><span aria-hidden="true">🔒</span><span class="pill-label">Lock</span></button>
+            <button class="pill-btn" id="logout-btn"><span class="pill-label">Sign Out</span><span class="pill-icon" aria-hidden="true">↪</span></button>
           </div>
-        </aside>
+        </header>
+        <div class="crumb" id="crumb"><a href="#/home" class="pill-btn small">← All apps</a></div>
         <main class="main" id="main" tabindex="-1"></main>
       </div>`.s;
+    const themeLabel = () => {
+      const dark = currentTheme() === 'dark';
+      $('#theme-label').textContent = dark ? 'Dark' : 'Light';
+      $('.theme-dot').classList.toggle('moon', dark);
+    };
+    themeLabel();
+    $('#theme-btn').addEventListener('click', () => { setTheme(currentTheme() === 'dark' ? 'light' : 'dark'); themeLabel(); });
     $('#logout-btn').addEventListener('click', async () => {
       await api('/logout', { method: 'POST' });
       state.user = null;
+      state.locked = null;
       location.hash = '';
       renderApp();
     });
-    $('#pw-btn').addEventListener('click', changePasswordModal);
-    $('#nav-toggle').addEventListener('click', () => $('.shell').classList.toggle('nav-open'));
-    $('.sidebar').addEventListener('click', (e) => { if (e.target.closest('a')) $('.shell').classList.remove('nav-open'); });
+    $('#lock-btn').addEventListener('click', async () => {
+      state.locked = { username: state.user.username, name: state.user.name };
+      await api('/logout', { method: 'POST' });
+      state.user = null;
+      renderApp();
+    });
+    $('#pw-btn').addEventListener('click', () => { $('.apps-menu').open = false; changePasswordModal(); });
+    $('.apps-list').addEventListener('click', (e) => { if (e.target.closest('a')) $('.apps-menu').open = false; });
   }
-  const route = currentRoute();
-  $$('.nav a').forEach((a) => {
+  const tile = TILES.find((t) => t.route === route);
+  $('#appbar-title').textContent = route === 'home' ? 'All apps' : (tile?.title || ROUTES[route].label);
+  $('#crumb').hidden = route === 'home';
+  $$('.apps-list a').forEach((a) => {
     if (a.dataset.route === route) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
   });
   const main = $('#main');
   main.innerHTML = '<div class="muted">Loading…</div>';
+  window.scrollTo(0, 0);
   ROUTES[route].render(main).catch((err) => {
     main.innerHTML = html`<div class="card"><strong>Couldn't load this page.</strong><div class="muted">${err.message}</div></div>`.s;
   });
@@ -238,23 +274,28 @@ window.addEventListener('hashchange', renderApp);
 // ---- auth pages ----------------------------------------------------------------------
 
 function pageLogin(app) {
+  const locked = state.locked;
   app.innerHTML = html`
     <div class="auth-wrap"><div class="card auth-card">
-      <div class="brand"><span class="brand-mark">AR</span>${state.businessName}</div>
-      <p>Sign in to clock in, manage inventory and more.</p>
+      <div class="brand"><span class="brand-mark">AR</span><span class="wordmark-text">${state.businessName}</span></div>
+      ${locked ? html`<div class="lock-face" aria-hidden="true">🔒</div><p><strong>${locked.name}</strong> locked this screen. Enter the password to unlock.</p>`
+        : html`<p>Sign in to clock in, list books and more.</p>`}
       <form id="login">
-        <label class="field">Username<input name="username" autocomplete="username" required></label>
+        <label class="field" ${locked ? 'hidden' : ''}>Username<input name="username" autocomplete="username" value="${locked?.username || ''}" required></label>
         <label class="field">Password<input name="password" type="password" autocomplete="current-password" required></label>
         <div class="error" role="alert"></div>
-        <button class="btn primary" type="submit">Sign in</button>
+        <button class="btn primary" type="submit">${locked ? 'Unlock' : 'Sign in'}</button>
+        ${locked ? html`<button class="btn link small" type="button" id="not-me">Not ${firstName(locked.name)}? Sign in as someone else</button>` : ''}
       </form>
     </div></div>`.s;
   const form = $('#login');
-  $('input', form).focus();
+  $(locked ? 'input[name=password]' : 'input', form).focus();
+  $('#not-me')?.addEventListener('click', () => { state.locked = null; pageLogin(app); });
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
       await api('/login', { method: 'POST', body: Object.fromEntries(new FormData(form)) });
+      state.locked = null;
       await boot();
     } catch (err) {
       $('.error', form).textContent = err.message;
@@ -265,7 +306,7 @@ function pageLogin(app) {
 function pageSetup(app) {
   app.innerHTML = html`
     <div class="auth-wrap"><div class="card auth-card">
-      <div class="brand"><span class="brand-mark">AR</span>Welcome</div>
+      <div class="brand"><span class="brand-mark">AR</span><span class="wordmark-text">Welcome</span></div>
       <p>Create the owner account to get started. You'll add employees afterward.</p>
       <form id="setup">
         <label class="field">Business name<input name="business_name" value="${state.businessName}"></label>
@@ -677,6 +718,7 @@ async function pageInventory(main) {
       <div><h1>Inventory</h1><div class="sub">${counts.active || 0} titles in stock</div></div>
       <div class="row">
         ${owner ? html`<a class="btn" href="/api/export/books.csv">Export CSV</a>` : ''}
+        <a class="btn" href="#/lister">📷 List a book</a>
         ${sheetLinked('inventory') ? '' : html`<button class="btn primary" id="add-book">+ Add book</button>`}
       </div>
     </div>
@@ -693,8 +735,9 @@ async function pageInventory(main) {
     </div>
     <div class="card">
       <div class="table-wrap"><table>
-        <thead><tr><th>SKU</th><th>Book</th><th>Condition</th><th>Shelf</th><th class="num">Qty</th>${owner ? html`<th class="num">Cost</th>` : ''}<th class="num">Price</th><th>Listed on</th><th></th></tr></thead>
+        <thead><tr><th><span class="sr-only">Photo</span></th><th>SKU</th><th>Book</th><th>Condition</th><th>Shelf</th><th class="num">Qty</th>${owner ? html`<th class="num">Cost</th>` : ''}<th class="num">Price</th><th>Listed on</th><th></th></tr></thead>
         <tbody>${books.length ? books.map((b) => html`<tr class="clickable" data-id="${b.id}">
+          <td class="thumb-cell">${bookThumb(b)}</td>
           <td class="nowrap small">${b.sku}</td>
           <td class="title-cell"><div class="t">${b.title}</div><div class="s">${[b.author, b.edition, b.pub_year].filter(Boolean).join(' · ')}</div></td>
           <td class="small">${b.condition}${b.binding ? html`<div class="muted">${b.binding}</div>` : ''}</td>
@@ -704,7 +747,7 @@ async function pageInventory(main) {
           <td class="num">${money(b.list_price_cents)}</td>
           <td><div class="chips">${LISTING_CHANNELS.filter((k) => b[`${k}_listed`]).map((k) => channelChip(k))}${b.archived ? html`<span class="pill">archived</span>` : ''}</div></td>
           <td class="num">${b.quantity > 0 && !b.archived && !sheetLinked('sales') ? html`<button class="btn small" data-sell="${b.id}">Sell</button>` : ''}</td>
-        </tr>`) : html`<tr><td colspan="9" class="empty">${invState.q ? 'No books match your search.' : 'Nothing here yet.'}</td></tr>`}
+        </tr>`) : html`<tr><td colspan="10" class="empty">${invState.q ? 'No books match your search.' : 'Nothing here yet.'}</td></tr>`}
         </tbody></table></div>
     </div>`.s;
 
@@ -744,6 +787,12 @@ async function bookModal(book, onDone) {
     submitLabel: readOnly ? null : 'Save',
     readOnly,
     wide: true,
+    prefix: isNew ? '' : html`<div class="modal-photos" id="modal-photos"><span class="muted small">Loading photos…</span></div>
+      <div class="row ebay-actions">
+        ${b.ebay_listed && /^\d+$/.test(b.ebay_ref) ? html`<a class="btn small" href="https://www.ebay.com/itm/${b.ebay_ref}" target="_blank" rel="noopener">View on eBay ↗</a>` : ''}
+        ${b.ebay_listed && b.ebay_offer_id ? html`<button type="button" class="btn small danger" id="end-ebay">End eBay listing</button>` : ''}
+        ${!b.ebay_listed && b.quantity > 0 && !b.archived ? html`<a class="btn small primary" href="#/lister?book=${b.id}" data-close-nav>List on eBay</a>` : ''}
+      </div>`,
     body: html`
       <div class="form-grid">
         <label class="field wide">Title<input name="title" value="${b.title || ''}" required></label>
@@ -786,6 +835,17 @@ async function bookModal(book, onDone) {
       onDone?.();
     },
     onOpen: (form, dlg) => {
+      if (!isNew) bookPhotosUi($('#modal-photos', form), b.id, onDone);
+      $('[data-close-nav]', form)?.addEventListener('click', () => dlg.close());
+      $('#end-ebay', form)?.addEventListener('click', async () => {
+        dlg.close();
+        if (!(await confirmModal('End eBay listing?', `This ends the eBay listing for "${b.title}" right away. You can list it again later.`, 'End listing'))) return;
+        try {
+          await api(`/books/${b.id}/ebay/end`, { method: 'POST' });
+          toast('eBay listing ended');
+        } catch (err) { toast(err.message, true); }
+        onDone?.();
+      });
       $('#del-book', form)?.addEventListener('click', async () => {
         dlg.close();
         if (!(await confirmModal('Delete book?', `Delete "${b.title}"? If it has sales, it will be archived instead so your sales history stays intact.`, 'Delete'))) return;
@@ -885,13 +945,46 @@ async function saleModal({ book = null, sale = null, onDone }) {
   });
 }
 
+async function bookPhotosUi(el, bookId, onChange) {
+  const render = (photos) => {
+    el.innerHTML = html`<div class="photo-strip small-strip">
+      ${photos.map((p, i) => html`<figure class="photo"><a href="${photoUrl(p.id, false)}" target="_blank" rel="noopener"><img src="${photoUrl(p.id)}" alt="Photo ${i + 1}"></a>
+        ${i === 0 ? html`<span class="cover-badge">Cover</span>` : html`<button type="button" class="photo-btn" data-cover="${p.id}" title="Make cover" aria-label="Make cover">★</button>`}
+        <button type="button" class="photo-btn del" data-del="${p.id}" title="Remove" aria-label="Remove photo">✕</button></figure>`)}
+      <label class="photo-add"><input type="file" accept="image/*" multiple hidden>📷<span>Add photos</span></label>
+    </div>`.s;
+    $('input[type=file]', el).addEventListener('change', async (e) => {
+      try {
+        const images = [];
+        for (const f of e.target.files) images.push(await photoFromFile(f));
+        render((await api(`/books/${bookId}/photos`, { method: 'POST', body: { images } })).photos);
+        onChange?.();
+      } catch (err) { toast(err.message, true); }
+    });
+    $$('[data-del]', el).forEach((b) => b.addEventListener('click', async () => { render((await api(`/photos/${b.dataset.del}`, { method: 'DELETE' })).photos); onChange?.(); }));
+    $$('[data-cover]', el).forEach((b) => b.addEventListener('click', async () => { render((await api(`/photos/${b.dataset.cover}/cover`, { method: 'POST' })).photos); onChange?.(); }));
+  };
+  render((await api(`/books/${bookId}`)).photos);
+}
+
 async function delistPrompt(bookId, channels, onDone) {
-  const names = channels.map((c) => CHANNELS[c].label).join(', ');
-  const ok = await confirmModal('Last copy sold — end other listings',
-    `That was the last copy, but it's still marked as listed on ${names}. End those listings on the sites now so it can't sell twice, then mark it delisted here.`,
-    'I ended them — mark delisted');
-  if (!ok) return;
   const { book } = await api(`/books/${bookId}`);
+  const autoEbay = channels.includes('ebay') && book.ebay_offer_id;
+  const others = channels.filter((c) => !(autoEbay && c === 'ebay')).map((c) => CHANNELS[c].label).join(', ');
+  const ok = await confirmModal('Last copy sold — end other listings',
+    autoEbay
+      ? `That was the last copy. The eBay listing can be ended for you now${others ? `; also end it on ${others} so it can't sell twice` : ''}.`
+      : `That was the last copy, but it's still marked as listed on ${others}. End those listings on the sites now so it can't sell twice, then mark it delisted here.`,
+    autoEbay ? `End eBay listing${others ? ' & mark all delisted' : ''}` : 'I ended them — mark delisted');
+  if (!ok) return;
+  if (autoEbay) {
+    try {
+      await api(`/books/${bookId}/ebay/end`, { method: 'POST' });
+    } catch (err) {
+      toast(`Couldn't end the eBay listing: ${err.message}`, true);
+      return;
+    }
+  }
   const body = { ...book };
   for (const k of LISTING_CHANNELS) body[`${k}_listed`] = false;
   await api(`/books/${bookId}`, { method: 'PUT', body });
@@ -1159,6 +1252,7 @@ async function pageSettings(main) {
   const [{ settings: s }, sh] = await Promise.all([api('/settings'), api('/sheets')]);
   main.innerHTML = html`
     <div class="page-head"><div><h1>Settings</h1></div></div>
+    <div id="ebay-card"><div class="card muted" style="max-width:860px;margin-bottom:16px">Loading eBay…</div></div>
     ${sheetsCard(sh)}
     <form class="card stack" id="settings-form" style="max-width:640px">
       <label class="field">Business name<input name="business_name" value="${s.business_name}" required></label>
@@ -1175,6 +1269,7 @@ async function pageSettings(main) {
       <div><button class="btn primary" type="submit">Save settings</button></div>
     </form>`.s;
   bindSheetsCard(main, () => pageSettings(main));
+  ebayCard($('#ebay-card')).catch((err) => { $('#ebay-card').innerHTML = html`<div class="alert">${err.message}</div>`.s; });
   const form = $('#settings-form');
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1256,6 +1351,420 @@ function bindSheetsCard(main, reload) {
     } catch (err) {
       $('.error', form).textContent = err.message;
     }
+  });
+}
+
+// ---- photos (shared) --------------------------------------------------------------------
+
+/** Resizes a photo in the browser to a JPEG data URL (keeps uploads small and fast). */
+async function resizeImage(file, max, quality = 0.85) {
+  const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bmp.width * scale);
+  canvas.height = Math.round(bmp.height * scale);
+  canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  bmp.close?.();
+  return canvas.toDataURL('image/jpeg', quality);
+}
+const photoFromFile = async (file) => ({ data: await resizeImage(file, 1600), thumb: await resizeImage(file, 360, 0.8) });
+const photoUrl = (id, thumb = true) => `/api/photos/${id}${thumb ? '?size=thumb' : ''}`;
+
+function bookThumb(b, cls = 'thumb') {
+  if (b.photo_id) return html`<img class="${cls}" src="${photoUrl(b.photo_id)}" alt="" loading="lazy">`;
+  const initials = (b.title || '?').replace(/^(the|a|an)\s+/i, '').slice(0, 2);
+  return html`<span class="${cls} thumb-empty" aria-hidden="true">${initials}</span>`;
+}
+
+// ---- home (app launcher) ------------------------------------------------------------------
+
+const TILES = [
+  { route: 'lister', emoji: '📸', title: 'eBay Listing Tool', desc: 'AI-powered listing app. Photograph a book cover, auto-fills all details and lists directly to eBay.' },
+  { route: 'clock', emoji: '⏰', title: 'Timeclock', desc: 'Employee clock in & out, unpaid breaks and shift history. Tracks hours for each pay week.' },
+  { route: 'dashboard', emoji: '📊', title: 'Owner Dashboard', desc: 'Sales by channel, expenses, profit & loss, and each employee’s hours, rate and weekly pay.', owner: true },
+  { route: 'inventory', emoji: '📚', title: 'Inventory', desc: 'Every book with photos, shelf location, cost and price, and where it’s listed.' },
+  { route: 'sales', emoji: '🧾', title: 'Sales', desc: 'Orders from eBay, Whatnot, Amazon and in person, with fees, postage and profit.', owner: true },
+  { route: 'expenses', emoji: '💳', title: 'Expenses', desc: 'Postage, supplies, book buys and subscriptions, sorted by category.', owner: true },
+  { route: 'payroll', emoji: '💵', title: 'Hours & Pay', desc: 'Weekly hours by day, overtime, rates and gross pay. Export or print for payroll.', owner: true },
+  { route: 'team', emoji: '👥', title: 'Team', desc: 'Add employees, set hourly rates and manage their sign-ins.', owner: true },
+  { route: 'settings', emoji: '⚙️', title: 'Settings', desc: 'Connect eBay and Google Sheets, set the pay week and overtime rules.', owner: true },
+];
+
+/** Badge in the card's corner: what state the app is in right now. */
+function tileBadge(route, h) {
+  if (route === 'lister') return h.ebay.ready ? { text: 'New', cls: 'new' } : { text: 'Setup', cls: 'setup' };
+  if (route === 'clock' && h.clock.since) return { text: 'On clock', cls: 'live' };
+  if (['inventory', 'sales', 'expenses'].includes(route) && sheetLinked(route)) return { text: 'Sheets', cls: 'sheet' };
+  if (route === 'settings') return null;
+  return { text: 'Live', cls: 'live' };
+}
+
+function tileStat(route, h) {
+  switch (route) {
+    case 'lister': return h.ebay.ready ? `${h.inventory.on_ebay} books listed on eBay` : h.ebay.connected ? 'Finish eBay setup in Settings' : 'Connect eBay in Settings';
+    case 'clock': return h.clock.since ? `Clocked in since ${prettyTime(h.clock.since)}` : `${hrs(h.clock.week_hours)} hrs this week`;
+    case 'dashboard': return `${money(h.sales.gross_cents)} in sales this month`;
+    case 'inventory': return `${h.inventory.titles} in stock · ${h.inventory.unlisted} not listed`;
+    case 'sales': return `${h.sales.orders} orders this month`;
+    case 'expenses': return `${money(h.expenses.cents)} this month`;
+    case 'payroll': return `${money(h.team.week_pay_cents)} pay this week`;
+    case 'team': return h.team.on_clock ? `${h.team.on_clock} on the clock now` : `${h.team.members} people`;
+    default: return '';
+  }
+}
+
+async function pageHome(main) {
+  const h = await api('/home');
+  const hour = new Date().getHours();
+  const greet = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+  main.innerHTML = html`
+    <div class="hub-head"><h1>${greet}, ${firstName(state.user.name)}</h1>
+      <div class="sub">${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</div></div>
+    <div class="tiles">
+      ${TILES.filter((t) => !t.owner || isOwner()).map((t) => {
+        const badge = tileBadge(t.route, h);
+        return html`<a class="app-tile" href="#/${t.route}">
+          <span class="tile-top"><span class="tile-icon" aria-hidden="true">${t.emoji}</span>
+            ${badge ? html`<span class="tile-badge ${badge.cls}">${badge.text}</span>` : ''}</span>
+          <span class="tile-title">${t.title}</span>
+          <span class="tile-desc">${t.desc}</span>
+          <span class="tile-foot"><span class="tile-stat">${tileStat(t.route, h)}</span><span class="tile-arrow" aria-hidden="true">→</span></span>
+        </a>`;
+      })}
+    </div>`.s;
+}
+
+// ---- eBay listing tool ----------------------------------------------------------------------
+
+const lister = { photos: [], existing: [], book: null, ai: null, form: {}, result: null };
+const GRADE_TO_EBAY = (g) => {
+  g = String(g || '').toLowerCase();
+  if (/as new|^new|^fine|near fine/.test(g)) return 'LIKE_NEW';
+  if (/very good/.test(g)) return 'USED_VERY_GOOD';
+  if (/good/.test(g)) return 'USED_GOOD';
+  if (/fair|poor/.test(g)) return 'USED_ACCEPTABLE';
+  return 'USED_GOOD';
+};
+const soldSearchUrl = (f) => `https://www.ebay.com/sch/i.html?${new URLSearchParams({ _nkw: [f.title, f.author, f.edition && /first|1st/i.test(f.edition) ? '1st edition' : ''].filter(Boolean).join(' '), LH_Sold: '1', LH_Complete: '1' })}`;
+
+function resetLister() {
+  Object.assign(lister, { photos: [], existing: [], book: null, ai: null, form: {}, result: null });
+}
+
+async function pageLister(main) {
+  const params = new URLSearchParams(location.hash.split('?')[1] || '');
+  const bookId = params.get('book');
+  if (bookId && String(lister.book?.id) !== bookId) {
+    resetLister();
+    const { book, photos } = await api(`/books/${bookId}`);
+    lister.book = book;
+    lister.existing = photos;
+    lister.form = {
+      ...book, cost: centsInput(book.cost_cents), price: centsInput(book.list_price_cents),
+      ebay_title: book.title.slice(0, 80), ebay_condition: GRADE_TO_EBAY(book.condition), category_id: '261186', language: 'English',
+    };
+  } else if (!bookId && lister.book) {
+    resetLister();
+  }
+  const eb = await api('/ebay');
+  renderLister(main, eb);
+}
+
+function renderLister(main, eb) {
+  const f = lister.form;
+  const ai = lister.ai;
+  const sheetBook = lister.book?.origin === 'sheet';
+  const allPhotos = [
+    ...lister.existing.map((p) => ({ kind: 'saved', id: p.id, src: photoUrl(p.id) })),
+    ...lister.photos.map((p, i) => ({ kind: 'new', i, src: p.thumb })),
+  ];
+  const ebayNote = !eb.configured ? (isOwner() ? 'eBay isn’t set up on the server yet — see the README.' : 'Ask the owner to set up eBay.')
+    : !eb.connected ? (isOwner() ? html`eBay isn’t connected. <a href="#/settings">Connect it in Settings</a>.` : 'Ask the owner to connect eBay.')
+      : !eb.ready ? (isOwner() ? html`Pick your eBay policies and ship-from location in <a href="#/settings">Settings</a>.` : 'Ask the owner to finish eBay setup.') : '';
+
+  if (lister.result) {
+    const r = lister.result;
+    main.innerHTML = html`
+      <div class="page-head"><div><h1>eBay Listing Tool</h1></div></div>
+      <div class="card lister-done">
+        ${r.photos?.[0] ? html`<img class="done-cover" src="${photoUrl(r.photos[0].id, false)}" alt="">` : ''}
+        <div>
+          <h2>${r.listing ? 'Listed on eBay!' : 'Saved to inventory'}</h2>
+          <p><strong>${r.book.title}</strong> · ${r.book.sku}</p>
+          ${r.ebayError ? html`<div class="alert"><span>⚠</span><span><strong>Couldn’t list on eBay:</strong> ${r.ebayError}<br>The book and photos are saved — fix the problem and try again from Inventory.</span></div>` : ''}
+          ${r.sheetNote ? html`<div class="sheet-banner"><span class="sheet-icon">▦</span><span>Inventory comes from your Google Sheet. Add this row to the sheet so the book stays after the next sync:
+            <code class="copy-row">${r.sheetNote}</code></span><button class="btn small" id="copy-row">Copy row</button></div>` : ''}
+          <div class="row" style="margin-top:12px">
+            ${r.listing ? html`<a class="btn primary" href="${r.listing.url}" target="_blank" rel="noopener">View on eBay ↗</a>` : ''}
+            ${r.ebayError ? html`<a class="btn primary" href="#/lister?book=${r.book.id}" id="retry">Try listing again</a>` : ''}
+            <button class="btn" id="another">List another book</button>
+            <a class="btn" href="#/inventory">Go to inventory</a>
+          </div>
+        </div>
+      </div>`.s;
+    $('#another').addEventListener('click', () => { resetLister(); if (location.hash !== '#/lister') location.hash = '#/lister'; else renderLister(main, eb); });
+    $('#retry')?.addEventListener('click', () => { lister.result = null; lister.book = null; });
+    $('#copy-row')?.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(r.sheetNote); toast('Copied — paste it into your sheet'); } catch { toast('Select the text and copy it', true); }
+    });
+    return;
+  }
+
+  main.innerHTML = html`
+    <div class="page-head">
+      <div><h1>eBay Listing Tool</h1><div class="sub">${lister.book ? html`Listing <strong>${lister.book.sku}</strong> from inventory` : 'Photograph a book, let AI fill in the details, then list it.'}</div></div>
+      <div class="row">${eb.connected ? html`<span class="pill good">● eBay${eb.user ? `: ${eb.user}` : ''}${eb.sandbox ? ' (sandbox)' : ''}</span>` : html`<span class="pill">eBay not connected</span>`}
+        ${(lister.photos.length || lister.book || Object.keys(f).length) ? html`<button class="btn small" id="start-over">Start over</button>` : ''}</div>
+    </div>
+    ${ebayNote ? html`<div class="alert"><span>ⓘ</span><span>${ebayNote} You can still save books to inventory.</span></div>` : ''}
+
+    <div class="card lister-step">
+      <div class="step-head"><span class="step-num">1</span><div><h2>Photos</h2><div class="muted small">Cover first. Adding the spine, copyright page and any flaws gives better details.</div></div></div>
+      <div class="photo-strip">
+        ${allPhotos.map((p, idx) => html`<figure class="photo">
+          <img src="${p.src}" alt="Photo ${idx + 1}">
+          ${idx === 0 ? html`<span class="cover-badge">Cover</span>` : html`<button type="button" class="photo-btn" data-cover="${p.kind}:${p.kind === 'new' ? p.i : p.id}" title="Make cover" aria-label="Make cover">★</button>`}
+          <button type="button" class="photo-btn del" data-del="${p.kind}:${p.kind === 'new' ? p.i : p.id}" title="Remove" aria-label="Remove photo">✕</button>
+        </figure>`)}
+        <label class="photo-add camera"><input type="file" accept="image/*" capture="environment" id="cam" hidden>📷<span>Take photo</span></label>
+        <label class="photo-add"><input type="file" accept="image/*" multiple id="pick" hidden>🖼️<span>Upload</span></label>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn primary big" id="ai-btn" ${allPhotos.length && eb.ai ? '' : 'disabled'}>✨ Fill in details with AI</button>
+        ${!eb.ai ? html`<span class="muted small">AI isn’t set up on the server (needs ANTHROPIC_API_KEY).</span>` : !allPhotos.length ? html`<span class="muted small">Add a photo of the cover to start.</span>` : ''}
+      </div>
+      ${ai ? html`<div class="ai-result">
+        <div class="row"><span class="pill ${ai.confidence === 'high' ? 'good' : ai.confidence === 'low' ? 'bad' : 'warn'}">AI confidence: ${ai.confidence}</span>
+          ${ai.price_high ? html`<span class="pill">Suggested price $${Math.round(ai.price_low)}–$${Math.round(ai.price_high)}</span>` : ''}
+          <a class="small" href="${soldSearchUrl(f)}" target="_blank" rel="noopener">Check sold listings on eBay ↗</a></div>
+        ${ai.price_reasoning ? html`<p class="small muted" style="margin:8px 0 0">${ai.price_reasoning}</p>` : ''}
+        ${ai.verify?.length ? html`<div class="verify"><strong class="small">Check before listing:</strong><ul>${ai.verify.map((v) => html`<li>${v}</li>`)}</ul></div>` : ''}
+      </div>` : ''}
+    </div>
+
+    <form id="lister-form" novalidate>
+    <div class="card lister-step">
+      <div class="step-head"><span class="step-num">2</span><div><h2>Book details</h2>
+        <div class="muted small">${sheetBook ? 'This book comes from your Google Sheet — edit these details there.' : 'Check what the AI filled in and correct anything that’s off.'}</div></div></div>
+      <fieldset class="plain" ${sheetBook ? 'disabled' : ''}><div class="form-grid">
+        <label class="field wide">Title<input name="title" value="${f.title || ''}" required></label>
+        <label class="field">Author<input name="author" value="${f.author || ''}"></label>
+        <label class="field">ISBN<input name="isbn" value="${f.isbn || ''}" inputmode="numeric"></label>
+        <label class="field">Publisher<input name="publisher" value="${f.publisher || ''}"></label>
+        <label class="field">Year<input name="pub_year" value="${f.pub_year || ''}" inputmode="numeric"></label>
+        <label class="field">Edition / printing<input name="edition" value="${f.edition || ''}"></label>
+        <label class="field">Binding<select name="binding">${['', 'Hardcover', 'Hardcover w/ DJ', 'Paperback', 'Mass Market', 'Leather', 'Other'].map((o) => html`<option ${f.binding === o ? 'selected' : ''}>${o}</option>`)}</select></label>
+        <label class="field">Condition (book grade)<select name="condition">${['', 'As New', 'Fine', 'Near Fine', 'Very Good', 'Good', 'Fair', 'Poor'].map((o) => html`<option ${f.condition === o ? 'selected' : ''}>${o}</option>`)}</select></label>
+        <label class="field">Shelf / location<input name="location" value="${f.location || ''}"></label>
+        <label class="field">Quantity<input name="quantity" type="number" min="1" step="1" value="${f.quantity || 1}"></label>
+        <label class="field">Cost (what you paid)<input name="cost" inputmode="decimal" value="${f.cost || ''}" placeholder="0.00"></label>
+        <label class="field">SKU<input name="sku" value="${f.sku || ''}" placeholder="Automatic"></label>
+      </div></fieldset>
+    </div>
+
+    <div class="card lister-step">
+      <div class="step-head"><span class="step-num">3</span><div><h2>eBay listing</h2><div class="muted small">What buyers will see.</div></div></div>
+      <div class="form-grid">
+        <label class="field wide"><span class="label-row">eBay title <span class="muted" id="title-count">${(f.ebay_title || '').length}/80</span></span><input name="ebay_title" maxlength="80" value="${f.ebay_title || ''}"></label>
+        <label class="field">Price<input name="price" inputmode="decimal" value="${f.price || ''}" placeholder="0.00"></label>
+        <label class="field">Category<select name="category_id">${Object.entries(eb.categories).map(([id, l]) => html`<option value="${id}" ${String(f.category_id || '261186') === id ? 'selected' : ''}>${l}</option>`)}</select></label>
+        <label class="field">eBay condition<select name="ebay_condition">${Object.entries(eb.conditions).map(([k, l]) => html`<option value="${k}" ${(f.ebay_condition || 'USED_GOOD') === k ? 'selected' : ''}>${l}</option>`)}</select></label>
+        <label class="field">Language<input name="language" value="${f.language || 'English'}"></label>
+        <label class="field">Genre / subject<input name="genre" value="${f.genre || ''}"></label>
+        <label class="field">Signed?<select name="signed">${['Unknown', 'No', 'Yes'].map((o) => html`<option ${(f.signed || 'Unknown') === o ? 'selected' : ''}>${o}</option>`)}</select></label>
+        <label class="field wide">Condition notes (flaws)<input name="condition_notes" value="${f.condition_notes || ''}" placeholder="e.g. Light shelf wear, small chip at spine head"></label>
+        <label class="field wide">Description<textarea name="description" rows="7">${f.description || ''}</textarea></label>
+      </div>
+    </div>
+    <div class="error" role="alert"></div>
+    <div class="lister-actions">
+      <button type="button" class="btn big" id="save-only">${lister.book ? 'Save changes' : 'Save to inventory'}</button>
+      <button type="submit" class="btn primary big" id="save-list" ${eb.ready ? '' : 'disabled'}>Save &amp; list on eBay</button>
+    </div>
+    </form>`.s;
+
+  const form = $('#lister-form');
+  const keep = () => { Object.assign(lister.form, Object.fromEntries(new FormData(form))); };
+  form.addEventListener('input', (e) => {
+    keep();
+    if (e.target.name === 'ebay_title') $('#title-count').textContent = `${e.target.value.length}/80`;
+  });
+  const rerender = () => { keep(); renderLister(main, eb); };
+
+  const addFiles = async (files) => {
+    keep();
+    for (const file of files) {
+      if (!file.type.startsWith('image/')) continue;
+      try { lister.photos.push(await photoFromFile(file)); } catch { toast(`Couldn't read ${file.name}`, true); }
+    }
+    renderLister(main, eb);
+  };
+  $('#cam').addEventListener('change', (e) => addFiles(e.target.files));
+  $('#pick').addEventListener('change', (e) => addFiles(e.target.files));
+  $('#start-over')?.addEventListener('click', () => { resetLister(); location.hash = '#/lister'; renderLister(main, eb); });
+
+  $$('[data-del]', main).forEach((b) => b.addEventListener('click', async () => {
+    const [kind, ref] = b.dataset.del.split(':');
+    if (kind === 'new') lister.photos.splice(Number(ref), 1);
+    else lister.existing = (await api(`/photos/${ref}`, { method: 'DELETE' })).photos;
+    rerender();
+  }));
+  $$('[data-cover]', main).forEach((b) => b.addEventListener('click', async () => {
+    const [kind, ref] = b.dataset.cover.split(':');
+    if (kind === 'new') {
+      if (lister.existing.length) return toast('Saved photos come first — remove them or reorder in Inventory', true);
+      lister.photos.unshift(...lister.photos.splice(Number(ref), 1));
+    } else {
+      lister.existing = (await api(`/photos/${ref}/cover`, { method: 'POST' })).photos;
+    }
+    rerender();
+  }));
+
+  $('#ai-btn').addEventListener('click', async (e) => {
+    keep();
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Reading the book…';
+    try {
+      // Saved photos are fetched back as data URLs so the AI sees them too.
+      const saved = await Promise.all(lister.existing.slice(0, 6).map(async (p) => {
+        const blob = await (await fetch(photoUrl(p.id, false))).blob();
+        return new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+      }));
+      const images = [...saved, ...lister.photos.map((p) => p.data)].slice(0, 6);
+      const { book: a } = await api('/ai/identify', { method: 'POST', body: { images } });
+      lister.ai = a;
+      const fill = (k, v) => { if (v !== undefined && v !== null && v !== '' && !(sheetBook && ['title', 'author', 'isbn', 'publisher', 'pub_year', 'edition', 'binding', 'condition'].includes(k))) lister.form[k] = v; };
+      fill('title', a.subtitle ? `${a.title}: ${a.subtitle}` : a.title);
+      ['author', 'isbn', 'publisher', 'pub_year', 'edition', 'binding', 'condition', 'language', 'genre', 'signed', 'condition_notes', 'ebay_title', 'description'].forEach((k) => fill(k, a[k]));
+      if (a.condition) fill('ebay_condition', GRADE_TO_EBAY(a.condition));
+      fill('category_id', a.collectible ? '29223' : '261186');
+      if (a.price_low && a.price_high && !lister.form.price) fill('price', (Math.max(1, Math.round((a.price_low + a.price_high) / 2)) - 0.01).toFixed(2));
+      lister.illustrator = a.illustrator;
+      toast('Details filled in — check them before listing');
+    } catch (err) {
+      toast(err.message, true);
+    }
+    renderLister(main, eb);
+  });
+
+  const save = async (list) => {
+    keep();
+    const v = lister.form;
+    const err = $('.error', form);
+    err.textContent = '';
+    if (!v.title && !sheetBook) { err.textContent = 'Add a title (or let the AI fill it in).'; return; }
+    if (list && !(toCents(v.price) > 0)) { err.textContent = 'Set a price before listing.'; return; }
+    if (list && !lister.photos.length && !lister.existing.length) { err.textContent = 'Add at least one photo — eBay requires it.'; return; }
+    const buttons = [$('#save-only'), $('#save-list')];
+    buttons.forEach((b) => { b.disabled = true; });
+    const target = list ? $('#save-list') : $('#save-only');
+    target.innerHTML = `<span class="spinner"></span> ${list ? 'Listing on eBay…' : 'Saving…'}`;
+    try {
+      const body = {
+        book_id: lister.book?.id,
+        book: {
+          sku: v.sku, title: v.title, author: v.author, isbn: v.isbn, publisher: v.publisher, pub_year: v.pub_year, edition: v.edition,
+          binding: v.binding, condition: v.condition, location: v.location, quantity: Number(v.quantity || 1), description: v.description,
+          cost_cents: toCents(v.cost), list_price_cents: toCents(v.price), acquired_date: lister.book?.acquired_date || today(),
+          ebay_listed: lister.book?.ebay_listed, ebay_ref: lister.book?.ebay_ref, whatnot_listed: lister.book?.whatnot_listed, whatnot_ref: lister.book?.whatnot_ref,
+          amazon_listed: lister.book?.amazon_listed, amazon_ref: lister.book?.amazon_ref, notes: lister.book?.notes, source: lister.book?.source,
+        },
+        images: lister.photos,
+        list: list ? {
+          title: v.ebay_title || v.title, description: v.description, condition: v.ebay_condition, condition_notes: v.condition_notes,
+          category_id: v.category_id, price_cents: toCents(v.price), quantity: Number(v.quantity || 1),
+          aspects: { language: v.language, genre: v.genre, signed: v.signed, illustrator: lister.illustrator },
+        } : null,
+      };
+      const r = await api('/lister/save', { method: 'POST', body });
+      if (sheetLinked('inventory') && r.book.origin !== 'sheet') {
+        const b = r.book;
+        r.sheetNote = [b.sku, b.title, b.author, b.quantity, centsInput(b.cost_cents), centsInput(b.list_price_cents), b.location, b.ebay_ref].join('\t');
+      }
+      lister.result = r;
+      lister.photos = [];
+      if (location.hash !== '#/lister') history.replaceState(null, '', '#/lister');
+      renderLister(main, eb);
+      toast(r.listing ? 'Listed on eBay!' : r.ebayError ? 'Saved, but eBay listing failed' : 'Saved to inventory', !!r.ebayError);
+    } catch (e) {
+      err.textContent = e.message;
+      buttons.forEach((b) => { b.disabled = false; });
+      target.textContent = list ? 'Save & list on eBay' : 'Save to inventory';
+      if (!eb.ready) $('#save-list').disabled = true;
+    }
+  };
+  $('#save-only').addEventListener('click', () => save(false));
+  form.addEventListener('submit', (e) => { e.preventDefault(); save(true); });
+}
+
+// ---- settings: eBay card -------------------------------------------------------------------
+
+async function ebayCard(el) {
+  const eb = await api('/ebay');
+  const flash = new URLSearchParams(location.hash.split('?')[1] || '').get('ebay');
+  if (flash) {
+    history.replaceState(null, '', '#/settings');
+    if (flash === 'connected') toast('eBay connected!'); else toast(flash, true);
+  }
+  let pol = null;
+  let polError = '';
+  if (eb.connected) {
+    try { pol = await api('/ebay/policies'); } catch (err) { polError = err.message; }
+  }
+  const sel = (name, list, idKey, current, empty) => html`<select name="${name}">
+    <option value="">${list.length ? '— Choose —' : empty}</option>
+    ${list.map((x) => html`<option value="${x[idKey]}" ${x[idKey] === current ? 'selected' : ''}>${x.name}</option>`)}</select>`;
+  el.innerHTML = html`
+    <form class="card stack" id="ebay-form" style="max-width:860px;margin-bottom:16px">
+      <div class="card-head" style="margin:0"><h2>eBay</h2>
+        ${eb.connected ? html`<span class="pill good">● Connected${eb.user ? ` as ${eb.user}` : ''}${eb.sandbox ? ' (sandbox)' : ''}</span>` : html`<span class="pill">Not connected</span>`}</div>
+      ${!eb.configured ? html`<p class="muted small" style="margin:0">To list on eBay, create a free eBay developer app and start the server with <code>EBAY_CLIENT_ID</code>, <code>EBAY_CLIENT_SECRET</code> and <code>EBAY_RU_NAME</code>. The README walks through it step by step.</p>`
+        : !eb.connected ? html`<p class="muted small" style="margin:0">Connect your eBay seller account so the Listing Tool can publish listings. You’ll sign in on eBay and approve access.</p>
+          <div><button type="button" class="btn primary" id="ebay-connect">Connect eBay account</button></div>`
+          : html`
+          ${polError ? html`<div class="alert"><span>⚠</span><span>Couldn’t load your eBay policies: ${polError}. If you don’t use business policies yet, turn them on in eBay Seller Hub (Account → Business policies).</span></div>` : ''}
+          ${pol ? html`<p class="muted small" style="margin:0">These are applied to every listing. Create or edit them in eBay Seller Hub, then reload this page.</p>
+          <div class="form-grid">
+            <label class="field">Shipping policy${sel('fulfillmentPolicyId', pol.fulfillment, 'id', pol.selected.fulfillmentPolicyId, 'No shipping policies on eBay')}</label>
+            <label class="field">Payment policy${sel('paymentPolicyId', pol.payment, 'id', pol.selected.paymentPolicyId, 'No payment policies on eBay')}</label>
+            <label class="field">Return policy${sel('returnPolicyId', pol.returns, 'id', pol.selected.returnPolicyId, 'No return policies on eBay')}</label>
+            <label class="field">Ships from${sel('merchantLocationKey', pol.locations, 'key', pol.selected.merchantLocationKey, 'No locations yet — add one below')}</label>
+          </div>
+          <details><summary class="small" style="cursor:pointer;color:var(--accent)">Add a ship-from location</summary>
+            <div class="form-grid" style="margin-top:10px" id="loc-form">
+              <label class="field">ZIP / postal code<input id="loc-zip" inputmode="numeric"></label>
+              <label class="field">City<input id="loc-city"></label>
+              <label class="field">State<input id="loc-state" maxlength="2" placeholder="e.g. NY"></label>
+              <div class="field" style="align-self:end"><button type="button" class="btn" id="loc-add">Add location</button></div>
+            </div></details>` : ''}
+          <div class="error" role="alert"></div>
+          <div class="row">${pol ? html`<button class="btn primary" type="submit">Save eBay settings</button>` : ''}
+            <button type="button" class="btn danger" id="ebay-disconnect">Disconnect</button></div>`}
+    </form>`.s;
+  const reload = () => ebayCard(el);
+  $('#ebay-connect', el)?.addEventListener('click', async () => {
+    try { location.href = (await api('/ebay/connect', { method: 'POST' })).url; } catch (err) { toast(err.message, true); }
+  });
+  $('#ebay-disconnect', el)?.addEventListener('click', async () => {
+    if (!(await confirmModal('Disconnect eBay?', 'The Listing Tool won’t be able to publish until you connect again. Existing listings stay on eBay.', 'Disconnect'))) return;
+    await api('/ebay/disconnect', { method: 'POST' });
+    toast('eBay disconnected');
+    reload();
+  });
+  $('#loc-add', el)?.addEventListener('click', async () => {
+    try {
+      await api('/ebay/locations', { method: 'POST', body: { postalCode: $('#loc-zip').value, city: $('#loc-city').value, state: $('#loc-state').value, name: 'Home' } });
+      toast('Location added');
+      reload();
+    } catch (err) { toast(err.message, true); }
+  });
+  $('#ebay-form', el).addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api('/ebay/settings', { method: 'PUT', body: Object.fromEntries(new FormData(e.target)) });
+      toast(r.ready ? 'eBay settings saved — you’re ready to list' : 'Saved. Pick all four to start listing.');
+    } catch (err) { $('.error', el).textContent = err.message; }
   });
 }
 
